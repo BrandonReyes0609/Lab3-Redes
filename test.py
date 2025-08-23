@@ -129,7 +129,7 @@ class NetworkTester:
         print(" Monitoreo completado")
     
     def cleanup(self, temp_script=None):
-        print("🧹 Limpiando procesos...")
+        print("Liando procesos...")
         for i, process in enumerate(self.processes):
             if process.poll() is None:
                 try:
