@@ -3,121 +3,207 @@ import socket
 import threading
 import time
 import sys
+import uuid
+from datetime import datetime
 
-# ---------- Parámetros Generales ----------
-PUERTO_BASE = 5000           # Puerto inicial al que se sumará un valor por nodo (por ejemplo A=5000, B=5001...)
-TAMANIO_BUFFER = 4096        # Tamaño máximo de datos a recibir por conexión
-TIEMPO_ESPERA_INICIAL = 3    # Tiempo para esperar a que todos los nodos inicien
-VALOR_TTL_INICIAL = 5        # TTL inicial para los paquetes enviados
 
-# ---------- Funciones auxiliares ----------
+PUERTO_BASE = 5000
+TAMANIO_BUFFER = 4096
+TIEMPO_ESPERA_INICIAL = 3
+VALOR_TTL_INICIAL = 5
+TIMEOUT_SOCKET = 2.0
 
-def obtener_puerto_desde_nombre(nombre_nodo):
-    codigo_ascii = ord(nombre_nodo.upper())
-    desplazamiento = codigo_ascii - ord('A')
-    puerto = PUERTO_BASE + desplazamiento
-    return puerto
-
-def cargar_topologia(nombre_archivo_json, nombre_nodo):
-    with open(nombre_archivo_json, 'r') as archivo_json:
-        datos_topologia = json.load(archivo_json)
-        diccionario_configuracion = datos_topologia["config"]
-        vecinos_del_nodo = diccionario_configuracion.get(nombre_nodo, [])
-        return vecinos_del_nodo
-
-def enviar_paquete_a_vecino(vecino, mensaje_serializado):
-    try:
-        puerto_vecino = obtener_puerto_desde_nombre(vecino)
-        socket_cliente = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        socket_cliente.connect(("localhost", puerto_vecino))
-        socket_cliente.sendall(mensaje_serializado.encode())
-        socket_cliente.close()
-        print("[ENVÍO] Enviado a " + vecino)
-    except Exception as error:
-        print("[ERROR] No se pudo enviar a " + vecino + ": " + str(error))
-
-# ---------- Componentes del nodo ----------
-
-def escuchar_conexiones(nombre_nodo, lista_vecinos, conjunto_mensajes_recibidos):
-    puerto_local = obtener_puerto_desde_nombre(nombre_nodo)
-    socket_servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    socket_servidor.bind(("localhost", puerto_local))
-    socket_servidor.listen()
-
-    print("[" + nombre_nodo + "] Nodo escuchando en puerto: " + str(puerto_local))
-
-    while True:
-        conexion, direccion = socket_servidor.accept()
-        datos_recibidos = conexion.recv(TAMANIO_BUFFER).decode()
-        conexion.close()
-
-        if datos_recibidos:
-            paquete = json.loads(datos_recibidos)
-
-            identificador_mensaje = paquete.get("headers", {}).get("id", None)
-
-            if identificador_mensaje is not None and identificador_mensaje in conjunto_mensajes_recibidos:
-                print("[" + nombre_nodo + "] Mensaje duplicado ignorado. ID: " + identificador_mensaje)
-                continue
-
-            if identificador_mensaje is not None:
-                conjunto_mensajes_recibidos.add(identificador_mensaje)
-
-            destino_paquete = paquete.get("to", "")
-            contenido_paquete = paquete.get("payload", "")
-            tiempo_vida_restante = paquete.get("ttl", 0)
-
-            if destino_paquete == nombre_nodo:
-                print("[" + nombre_nodo + "] Mensaje recibido correctamente: " + contenido_paquete)
-            elif tiempo_vida_restante > 0:
-                paquete["ttl"] = tiempo_vida_restante - 1
-                mensaje_serializado = json.dumps(paquete)
-                reenviar_a_vecinos(nombre_nodo, lista_vecinos, mensaje_serializado)
-
-def reenviar_a_vecinos(nombre_nodo, lista_vecinos, mensaje_serializado):
-    print("[" + nombre_nodo + "] Reenviando a vecinos...")
-    for nombre_vecino in lista_vecinos:
-        enviar_paquete_a_vecino(nombre_vecino, mensaje_serializado)
-
-def iniciar_nodo(nombre_nodo, archivo_topologia):
-    vecinos_nodo = cargar_topologia(archivo_topologia, nombre_nodo)
-    historial_mensajes = set()
-
-    hilo_de_escucha = threading.Thread(
-        target=escuchar_conexiones,
-        args=(nombre_nodo, vecinos_nodo, historial_mensajes),
-        daemon=True
-    )
-    hilo_de_escucha.start()
-
-    time.sleep(TIEMPO_ESPERA_INICIAL)
-
-    if nombre_nodo.upper() == "A":
-        mensaje_inicial = {
+class FloodingNode:
+    def __init__(self, nombre_nodo, archivo_topologia):
+        self.nombre_nodo = nombre_nodo.upper()
+        self.vecinos = self.cargar_topologia(archivo_topologia)
+        self.mensajes_recibidos = set()  
+        self.puerto = self.obtener_puerto()
+        self.socket_servidor = None
+        self.activo = True
+        
+        print(f"[{self.nombre_nodo}] Nodo inicializado con vecinos: {self.vecinos}")
+    
+    def obtener_puerto(self):
+        codigo_ascii = ord(self.nombre_nodo)
+        desplazamiento = codigo_ascii - ord('A')
+        return PUERTO_BASE + desplazamiento
+    
+    def cargar_topologia(self, archivo_json):
+        try:
+            with open(archivo_json, 'r', encoding='utf-8') as archivo:
+                datos_topologia = json.load(archivo)
+                vecinos = datos_topologia["config"].get(self.nombre_nodo, [])
+                return vecinos
+        except Exception as e:
+            print(f"[ERROR] No se pudo cargar topología: {e}")
+            return []
+    
+    def crear_mensaje(self, destino, contenido, tipo="message"):
+        return {
             "proto": "flooding",
-            "type": "message",
-            "from": "A",
-            "to": "D",
+            "type": tipo,
+            "from": self.nombre_nodo,
+            "to": destino,
             "ttl": VALOR_TTL_INICIAL,
             "headers": {
-                "id": "msg001"
+                "id": str(uuid.uuid4())[:8],
+                "timestamp": datetime.now().isoformat()
             },
-            "payload": "Saludos desde el nodo A usando Flooding."
+            "payload": contenido
         }
-        mensaje_serializado = json.dumps(mensaje_inicial)
-        reenviar_a_vecinos(nombre_nodo, vecinos_nodo, mensaje_serializado)
+    
+    def enviar_a_vecino(self, vecino, mensaje_json):
+        try:
+            puerto_vecino = PUERTO_BASE + (ord(vecino) - ord('A'))
+            
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(TIMEOUT_SOCKET)
+                sock.connect(("localhost", puerto_vecino))
+                sock.sendall(mensaje_json.encode('utf-8'))
+                
+            print(f"[{self.nombre_nodo}] Enviado a {vecino}")
+            return True
+            
+        except Exception as e:
+            print(f"[{self.nombre_nodo}] Error enviando a {vecino}: {e}")
+            return False
+    
+    def flooding_broadcast(self, mensaje):
+        mensaje_json = json.dumps(mensaje, ensure_ascii=False)
+        
+        print(f"[{self.nombre_nodo}] Aplicando flooding a vecinos: {self.vecinos}")
+        
+        enviados_exitosos = 0
+        for vecino in self.vecinos:
+            if self.enviar_a_vecino(vecino, mensaje_json):
+                enviados_exitosos += 1
+        
+        print(f"[{self.nombre_nodo}] Flooding completado: {enviados_exitosos}/{len(self.vecinos)} enviados")
+    
+    def procesar_mensaje_recibido(self, mensaje):
+        try:
+            paquete = json.loads(mensaje)
+            
+            
+            msg_id = paquete.get("headers", {}).get("id")
+            destino = paquete.get("to", "")
+            contenido = paquete.get("payload", "")
+            ttl = paquete.get("ttl", 0)
+            origen = paquete.get("from", "")
+            
+            
+            if msg_id and msg_id in self.mensajes_recibidos:
+                print(f"[{self.nombre_nodo}] Mensaje duplicado ignorado (ID: {msg_id})")
+                return
+            
+            
+            if msg_id:
+                self.mensajes_recibidos.add(msg_id)
+            
+            print(f"[{self.nombre_nodo}] Mensaje recibido de {origen} -> {destino} (TTL: {ttl})")
+            
+            
+            if destino == self.nombre_nodo:
+                print(f"[{self.nombre_nodo}] MENSAJE DESTINO: '{contenido}'")
+                
+                return
+            
+            
+            if ttl > 0:
+                paquete["ttl"] = ttl - 1
+                print(f"[{self.nombre_nodo}] Reenviando mensaje (nuevo TTL: {ttl-1})")
+                self.flooding_broadcast(paquete)
+            else:
+                print(f"[{self.nombre_nodo}] Mensaje descartado (TTL agotado)")
+                
+        except json.JSONDecodeError as e:
+            print(f"[{self.nombre_nodo}] Error decodificando JSON: {e}")
+        except Exception as e:
+            print(f"[{self.nombre_nodo}] Error procesando mensaje: {e}")
+    
+    def escuchar_conexiones(self):
+        try:
+            self.socket_servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket_servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket_servidor.bind(("localhost", self.puerto))
+            self.socket_servidor.listen(5)
+            
+            print(f"[{self.nombre_nodo}] Escuchando en puerto {self.puerto}")
+            
+            while self.activo:
+                try:
+                    conexion, direccion = self.socket_servidor.accept()
+                    
+                    
+                    hilo_conexion = threading.Thread(
+                        target=self.manejar_conexion,
+                        args=(conexion,),
+                        daemon=True
+                    )
+                    hilo_conexion.start()
+                    
+                except socket.error as e:
+                    if self.activo:  
+                        print(f"[{self.nombre_nodo}] Error en socket: {e}")
+                        
+        except Exception as e:
+            print(f"[{self.nombre_nodo}] Error en servidor: {e}")
+        finally:
+            if self.socket_servidor:
+                self.socket_servidor.close()
+    
+    def manejar_conexion(self, conexion):
+        try:
+            with conexion:
+                datos = conexion.recv(TAMANIO_BUFFER).decode('utf-8')
+                if datos:
+                    self.procesar_mensaje_recibido(datos)
+        except Exception as e:
+            print(f"[{self.nombre_nodo}] Error manejando conexión: {e}")
+    
+    def enviar_mensaje_inicial(self):
+        if self.nombre_nodo == "A":
+            time.sleep(TIEMPO_ESPERA_INICIAL)  
+            
+            mensaje = self.crear_mensaje(
+                destino="D",
+                contenido=f"¡Saludos desde el nodo {self.nombre_nodo} usando Flooding! - {datetime.now().strftime('%H:%M:%S')}"
+            )
+            
+            print(f"[{self.nombre_nodo}] Iniciando comunicación...")
+            self.flooding_broadcast(mensaje)
+    
+    def iniciar(self):
+        print(f"[{self.nombre_nodo}] Iniciando nodo flooding...")
+        
+        
+        hilo_servidor = threading.Thread(target=self.escuchar_conexiones, daemon=True)
+        hilo_servidor.start()
+        
+        
+        hilo_inicial = threading.Thread(target=self.enviar_mensaje_inicial, daemon=True)
+        hilo_inicial.start()
+        
+        try:
+            while self.activo:
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            print(f"\n[{self.nombre_nodo}] Deteniendo nodo...")
+            self.activo = False
+            if self.socket_servidor:
+                self.socket_servidor.close()
 
-    while True:
-        time.sleep(1)  # Mantener el hilo principal vivo
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(1)
+    
+    nombre_nodo = sys.argv[1].upper()
+    archivo_topologia = sys.argv[2]
+    
+    nodo = FloodingNode(nombre_nodo, archivo_topologia)
+    nodo.iniciar()
 
-# ---------- Punto de entrada principal ----------
-
-
-if len(sys.argv) != 3:
-    print("Uso correcto: python flooding_node_explicit.py <NOMBRE_NODO> <ARCHIVO_TOPOLOGIA>")
-    sys.exit(1)
-
-nombre_nodo_ingresado = sys.argv[1]
-archivo_topologia_ingresado = sys.argv[2]
-
-iniciar_nodo(nombre_nodo_ingresado, archivo_topologia_ingresado)
+if __name__ == "__main__":
+    main()
