@@ -6,16 +6,22 @@ import socket
 import uuid
 import redis
 import time
+import heapq
 from datetime import datetime
 from abc import ABC, abstractmethod
+from collections import defaultdict
 
 
 PUERTO_BASE_LOCAL = 5000
 TAMANIO_BUFFER = 4096
 VALOR_TTL_INICIAL = 5
+INTERVALO_LSP = 30
+INTERVALO_DV = 10
+MAX_DISTANCIA = 16
+
+
 
 class CommunicationMode(ABC):
-    
     @abstractmethod
     def initialize(self):
         pass
@@ -32,8 +38,29 @@ class CommunicationMode(ABC):
     def cleanup(self):
         pass
 
-class LocalSocketMode(CommunicationMode):
+class RoutingAlgorithm(ABC):
+    def __init__(self, nodo_id, vecinos, communication_mode):
+        self.nodo_id = nodo_id
+        self.vecinos = vecinos
+        self.communication_mode = communication_mode
+        self.activo = True
+        self.mensajes_procesados = set()
     
+    @abstractmethod
+    def process_message(self, mensaje):
+        pass
+    
+    @abstractmethod
+    def send_initial_messages(self):
+        pass
+    
+    @abstractmethod
+    def get_algorithm_name(self):
+        pass
+
+
+
+class LocalSocketMode(CommunicationMode):
     def __init__(self, nodo_id):
         self.nodo_id = nodo_id
         self.puerto = PUERTO_BASE_LOCAL + (ord(nodo_id.upper()) - ord('A'))
@@ -90,14 +117,12 @@ class LocalSocketMode(CommunicationMode):
                 pass
 
 class RedisMode(CommunicationMode):
-    
     def __init__(self, nodo_id, redis_config, channels_config=None):
         self.nodo_id = nodo_id
         self.redis_config = redis_config
         self.redis_client = None
         self.pubsub = None
         self.activo = True
-        
         
         if channels_config:
             self.mis_canales = channels_config.get("subscribe", [f"sec20.topologia1.node{nodo_id.lower()}"])
@@ -115,11 +140,8 @@ class RedisMode(CommunicationMode):
                 decode_responses=True
             )
             
-            
             self.redis_client.ping()
-            
             self.pubsub = self.redis_client.pubsub()
-            
             
             for canal in self.mis_canales:
                 self.pubsub.subscribe(canal)
@@ -135,12 +157,10 @@ class RedisMode(CommunicationMode):
     
     def send_message(self, destino, mensaje):
         try:
-            
             if destino.upper() in self.canales_vecinos:
                 canal_destino = self.canales_vecinos[destino.upper()]
             else:
                 canal_destino = f"sec20.topologia1.node{destino.lower()}"
-            
             
             mensaje_redis = {
                 "proto": "gui_redis",
@@ -156,33 +176,45 @@ class RedisMode(CommunicationMode):
                 "payload": mensaje.get("payload", "")
             }
             
-            
-            print(f"[{self.nodo_id}] Enviando a canal {canal_destino}: {mensaje_redis['type']}")
-            
             self.redis_client.publish(canal_destino, json.dumps(mensaje_redis))
             return True
         except Exception as e:
-            print(f"[{self.nodo_id}] Error enviando a {destino}: {e}")
+            return False, str(e)
+    
+    def broadcast_message(self, mensaje):
+        try:
+            enviados = 0
+            for vecino, canal in self.canales_vecinos.items():
+                mensaje_redis = {
+                    "proto": "gui_redis",
+                    "type": mensaje.get("type", "message"),
+                    "from": self.nodo_id,
+                    "to": "broadcast",
+                    "ttl": mensaje.get("ttl", 5),
+                    "headers": {
+                        "id": mensaje.get("headers", {}).get("id", str(uuid.uuid4())[:8]),
+                        "timestamp": datetime.now().isoformat(),
+                        "channel": canal
+                    },
+                    "payload": mensaje.get("payload", "")
+                }
+                
+                self.redis_client.publish(canal, json.dumps(mensaje_redis))
+                enviados += 1
+            return enviados
+        except Exception as e:
             return False, str(e)
     
     def start_listening(self, callback):
         def escuchar():
             try:
-                print(f"[{self.nodo_id}] Iniciando listener Redis...")
                 for mensaje in self.pubsub.listen():
                     if not self.activo:
                         break
                     if mensaje['type'] == 'message':
-                        
-                        canal = mensaje.get('channel', 'unknown')
-                        print(f"[{self.nodo_id}] Mensaje recibido en canal: {canal}")
                         if callback:
                             callback(mensaje['data'])
-                    elif mensaje['type'] == 'subscribe':
-                        canal = mensaje.get('channel', 'unknown')
-                        print(f"[{self.nodo_id}] Suscrito exitosamente a: {canal}")
             except Exception as e:
-                print(f"[{self.nodo_id}] Error en listener Redis: {e}")
                 if callback and self.activo:
                     callback(f"Error Redis: {e}")
         
@@ -196,23 +228,399 @@ class RedisMode(CommunicationMode):
                 self.pubsub.close()
             except:
                 pass
-        if self.redis_client:
-            try:
-                self.redis_client.close()
-            except:
-                pass
 
-class HybridNetworkGUI:
+
+
+class FloodingAlgorithm(RoutingAlgorithm):
+    def get_algorithm_name(self):
+        return "flooding"
+    
+    def process_message(self, paquete):
+        tipo = paquete.get("type", "")
+        origen = paquete.get("from", "")
+        destino = paquete.get("to", "")
+        contenido = paquete.get("payload", "")
+        ttl = paquete.get("ttl", 0)
+        
+        if destino == self.nodo_id:
+            return f"MENSAJE RECIBIDO de {origen}: '{contenido}'"
+        elif ttl > 1:
+            paquete["ttl"] = ttl - 1
+            self.flood_message(paquete, origen)
+            return f"Mensaje reenviado por flooding (TTL: {ttl-1})"
+        else:
+            return "TTL agotado, mensaje descartado"
+    
+    def flood_message(self, mensaje, origen=None):
+        if isinstance(self.communication_mode, RedisMode):
+            self.communication_mode.broadcast_message(mensaje)
+        else:
+            for vecino in self.vecinos:
+                if vecino != origen:
+                    self.communication_mode.send_message(vecino, mensaje)
+    
+    def send_initial_messages(self):
+        if self.nodo_id == "A":
+            time.sleep(3)
+            mensaje = {
+                "proto": "flooding_gui",
+                "type": "message",
+                "from": self.nodo_id,
+                "to": "D",
+                "ttl": VALOR_TTL_INICIAL,
+                "headers": {
+                    "id": str(uuid.uuid4())[:8],
+                    "timestamp": datetime.now().isoformat()
+                },
+                "payload": f"Mensaje de prueba desde {self.nodo_id} usando Flooding!"
+            }
+            self.flood_message(mensaje)
+
+class LinkStateAlgorithm(RoutingAlgorithm):
+    def __init__(self, nodo_id, vecinos, communication_mode):
+        super().__init__(nodo_id, vecinos, communication_mode)
+        self.lsdb = {}
+        self.tabla_enrutamiento = {}
+        self.secuencia_lsp = 0
+        self.lock = threading.Lock()
+        
+        self.generar_lsp_propio()
+        threading.Thread(target=self.envio_periodico_lsp, daemon=True).start()
+    
+    def get_algorithm_name(self):
+        return "link_state"
+    
+    def generar_lsp_propio(self):
+        with self.lock:
+            self.secuencia_lsp += 1
+            timestamp = time.time()
+            
+            self.lsdb[self.nodo_id] = {
+                'secuencia': self.secuencia_lsp,
+                'vecinos': self.vecinos,
+                'timestamp': timestamp
+            }
+    
+    def process_message(self, paquete):
+        tipo = paquete.get("type", "")
+        origen = paquete.get("from", "")
+        destino = paquete.get("to", "")
+        contenido = paquete.get("payload", "")
+        ttl = paquete.get("ttl", 0)
+        
+        if tipo == "lsp":
+            return self.procesar_lsp(paquete)
+        elif tipo == "message":
+            if destino == self.nodo_id:
+                return f"MENSAJE RECIBIDO de {origen}: '{contenido}'"
+            elif ttl > 1:
+                return self.reenviar_mensaje(destino, paquete)
+            else:
+                return "TTL agotado"
+        
+        return f"Mensaje procesado: {tipo} de {origen}"
+    
+    def procesar_lsp(self, paquete):
+        payload = paquete.get("payload", {})
+        nodo_origen = payload.get("nodo_origen", paquete.get("from"))
+        secuencia = payload.get("secuencia", 1)
+        vecinos = payload.get("vecinos", [])
+        timestamp = payload.get("timestamp", time.time())
+        
+        with self.lock:
+            lsp_nuevo = (nodo_origen not in self.lsdb or 
+                        secuencia > self.lsdb[nodo_origen]['secuencia'])
+            
+            if lsp_nuevo:
+                self.lsdb[nodo_origen] = {
+                    'secuencia': secuencia,
+                    'vecinos': vecinos,
+                    'timestamp': timestamp
+                }
+                
+                self.calcular_dijkstra()
+                
+                if paquete.get("ttl", 0) > 1:
+                    paquete["ttl"] = paquete["ttl"] - 1
+                    if isinstance(self.communication_mode, RedisMode):
+                        self.communication_mode.broadcast_message(paquete)
+                    else:
+                        for vecino in self.vecinos:
+                            if vecino != paquete.get("from"):
+                                self.communication_mode.send_message(vecino, paquete)
+                
+                return f"LSP de {nodo_origen} procesado y reenviado"
+            else:
+                return f"LSP de {nodo_origen} ignorado (más antiguo)"
+    
+    def calcular_dijkstra(self):
+        grafo = defaultdict(dict)
+        
+        for nodo, info in self.lsdb.items():
+            for vecino in info.get('vecinos', []):
+                grafo[nodo][vecino] = 1
+        
+        if not grafo or self.nodo_id not in grafo:
+            return
+        
+        distancias = {nodo: float('inf') for nodo in grafo}
+        distancias[self.nodo_id] = 0
+        predecesores = {}
+        visitados = set()
+        cola = [(0, self.nodo_id)]
+        
+        while cola:
+            dist_actual, nodo_actual = heapq.heappop(cola)
+            
+            if nodo_actual in visitados:
+                continue
+            
+            visitados.add(nodo_actual)
+            
+            for vecino, peso in grafo.get(nodo_actual, {}).items():
+                if vecino not in visitados:
+                    nueva_dist = dist_actual + peso
+                    if nueva_dist < distancias[vecino]:
+                        distancias[vecino] = nueva_dist
+                        predecesores[vecino] = nodo_actual
+                        heapq.heappush(cola, (nueva_dist, vecino))
+        
+        nueva_tabla = {}
+        for destino, dist in distancias.items():
+            if destino != self.nodo_id and dist != float('inf'):
+                nodo_temp = destino
+                while predecesores.get(nodo_temp) != self.nodo_id and nodo_temp in predecesores:
+                    nodo_temp = predecesores[nodo_temp]
+                
+                if predecesores.get(nodo_temp) == self.nodo_id:
+                    nueva_tabla[destino] = {
+                        'next_hop': nodo_temp,
+                        'distance': int(dist)
+                    }
+        
+        self.tabla_enrutamiento = nueva_tabla
+    
+    def reenviar_mensaje(self, destino, paquete):
+        if destino in self.tabla_enrutamiento:
+            info = self.tabla_enrutamiento[destino]
+            siguiente_salto = info['next_hop']
+            paquete["ttl"] = paquete["ttl"] - 1
+            
+            self.communication_mode.send_message(siguiente_salto, paquete)
+            return f"Mensaje reenviado a {destino} via {siguiente_salto}"
+        else:
+            return f"No hay ruta conocida a {destino}"
+    
+    def enviar_lsp(self):
+        lsp_info = self.lsdb.get(self.nodo_id)
+        if lsp_info:
+            mensaje_lsp = {
+                "proto": "lsr_gui",
+                "type": "lsp",
+                "from": self.nodo_id,
+                "to": "broadcast",
+                "ttl": 15,
+                "headers": {
+                    "id": str(uuid.uuid4())[:8],
+                    "timestamp": datetime.now().isoformat(),
+                    "lsp_origen": self.nodo_id,
+                    "lsp_secuencia": lsp_info['secuencia']
+                },
+                "payload": {
+                    "nodo_origen": self.nodo_id,
+                    "secuencia": lsp_info['secuencia'],
+                    "vecinos": lsp_info['vecinos'],
+                    "timestamp": lsp_info['timestamp']
+                }
+            }
+            
+            if isinstance(self.communication_mode, RedisMode):
+                self.communication_mode.broadcast_message(mensaje_lsp)
+            else:
+                for vecino in self.vecinos:
+                    self.communication_mode.send_message(vecino, mensaje_lsp)
+    
+    def envio_periodico_lsp(self):
+        while self.activo:
+            time.sleep(INTERVALO_LSP)
+            if self.activo:
+                self.generar_lsp_propio()
+                self.enviar_lsp()
+    
+    def send_initial_messages(self):
+        time.sleep(2)
+        self.enviar_lsp()
+        
+        if self.nodo_id == "A":
+            time.sleep(10)
+            mensaje = {
+                "proto": "lsr_gui",
+                "type": "message",
+                "from": self.nodo_id,
+                "to": "D",
+                "ttl": 15,
+                "headers": {
+                    "id": str(uuid.uuid4())[:8],
+                    "timestamp": datetime.now().isoformat()
+                },
+                "payload": f"Mensaje de prueba desde {self.nodo_id} usando LSR!"
+            }
+            
+            if "D" in self.tabla_enrutamiento:
+                self.reenviar_mensaje("D", mensaje)
+
+class DistanceVectorAlgorithm(RoutingAlgorithm):
+    def __init__(self, nodo_id, vecinos, communication_mode):
+        super().__init__(nodo_id, vecinos, communication_mode)
+        self.tabla_enrutamiento = {}
+        self.tablas_vecinos = defaultdict(dict)
+        self.lock = threading.Lock()
+        
+        self.inicializar_tabla()
+        threading.Thread(target=self.actualizacion_periodica, daemon=True).start()
+    
+    def get_algorithm_name(self):
+        return "distance_vector"
+    
+    def inicializar_tabla(self):
+        with self.lock:
+            self.tabla_enrutamiento[self.nodo_id] = {
+                'distance': 0,
+                'next_hop': self.nodo_id
+            }
+            
+            for vecino in self.vecinos:
+                self.tabla_enrutamiento[vecino] = {
+                    'distance': 1,
+                    'next_hop': vecino
+                }
+    
+    def process_message(self, paquete):
+        tipo = paquete.get("type", "")
+        origen = paquete.get("from", "")
+        destino = paquete.get("to", "")
+        contenido = paquete.get("payload", "")
+        ttl = paquete.get("ttl", 0)
+        
+        if tipo == "distance_vector":
+            return self.procesar_vector(origen, contenido)
+        elif tipo == "message":
+            if destino == self.nodo_id:
+                return f"MENSAJE RECIBIDO de {origen}: '{contenido}'"
+            elif ttl > 1:
+                return self.reenviar_mensaje(destino, paquete)
+            else:
+                return "TTL agotado"
+        
+        return f"Mensaje procesado: {tipo} de {origen}"
+    
+    def procesar_vector(self, vecino, vector_distancias):
+        with self.lock:
+            self.tablas_vecinos[vecino] = vector_distancias
+            tabla_actualizada = False
+            
+            for destino, distancia_vecino in vector_distancias.items():
+                if destino == self.nodo_id:
+                    continue
+                
+                distancia_via_vecino = 1 + distancia_vecino
+                
+                if (destino not in self.tabla_enrutamiento or 
+                    distancia_via_vecino < self.tabla_enrutamiento[destino]['distance']):
+                    
+                    self.tabla_enrutamiento[destino] = {
+                        'distance': distancia_via_vecino,
+                        'next_hop': vecino
+                    }
+                    tabla_actualizada = True
+            
+            if tabla_actualizada:
+                self.enviar_vector()
+        
+        return f"Vector de {vecino} procesado"
+    
+    def reenviar_mensaje(self, destino, paquete):
+        with self.lock:
+            if destino in self.tabla_enrutamiento:
+                info = self.tabla_enrutamiento[destino]
+                if info['distance'] < MAX_DISTANCIA:
+                    siguiente_salto = info['next_hop']
+                    paquete["ttl"] = paquete["ttl"] - 1
+                    self.communication_mode.send_message(siguiente_salto, paquete)
+                    return f"Mensaje reenviado a {destino} via {siguiente_salto}"
+                else:
+                    return f"Destino {destino} inalcanzable"
+            else:
+                return f"No hay ruta conocida a {destino}"
+    
+    def enviar_vector(self):
+        with self.lock:
+            vector_distancias = {}
+            for destino, info in self.tabla_enrutamiento.items():
+                if info['distance'] < MAX_DISTANCIA:
+                    vector_distancias[destino] = info['distance']
+        
+        mensaje = {
+            "proto": "dvr_gui",
+            "type": "distance_vector",
+            "from": self.nodo_id,
+            "to": "broadcast",
+            "ttl": 1,
+            "headers": {
+                "id": str(uuid.uuid4())[:8],
+                "timestamp": datetime.now().isoformat()
+            },
+            "payload": vector_distancias
+        }
+        
+        if isinstance(self.communication_mode, RedisMode):
+            self.communication_mode.broadcast_message(mensaje)
+        else:
+            for vecino in self.vecinos:
+                self.communication_mode.send_message(vecino, mensaje)
+    
+    def actualizacion_periodica(self):
+        while self.activo:
+            time.sleep(INTERVALO_DV)
+            if self.activo:
+                self.enviar_vector()
+    
+    def send_initial_messages(self):
+        time.sleep(3)
+        self.enviar_vector()
+        
+        if self.nodo_id == "A":
+            time.sleep(8)
+            mensaje = {
+                "proto": "dvr_gui",
+                "type": "message",
+                "from": self.nodo_id,
+                "to": "D",
+                "ttl": 15,
+                "headers": {
+                    "id": str(uuid.uuid4())[:8],
+                    "timestamp": datetime.now().isoformat()
+                },
+                "payload": f"Mensaje de prueba desde {self.nodo_id} usando DVR!"
+            }
+            
+            with self.lock:
+                if "D" in self.tabla_enrutamiento and self.tabla_enrutamiento["D"]["distance"] < MAX_DISTANCIA:
+                    self.reenviar_mensaje("D", mensaje)
+
+
+
+class EnhancedNetworkGUI:
     def __init__(self):
         self.ventana = tk.Tk()
-        self.ventana.title("Router GUI - Modo Híbrido (Local/Redis)")
-        self.ventana.geometry("800x700")
+        self.ventana.title("Router GUI")
+        self.ventana.geometry("900x750")
         
         
         self.nodo_id = "A"
         self.vecinos = ["B", "C", "D"]
-        self.modo_actual = None
         self.communication_mode = None
+        self.routing_algorithm = None
         self.mensajes_recibidos = set()
         
         
@@ -222,26 +630,18 @@ class HybridNetworkGUI:
             'password': ''
         }
         
-        
         self.configuracion_canales = {
             'subscribe': [],
             'neighbors': {}
         }
-        
-        
-        self.message_format = "flexible"
-        self.node_name_format = "letters"
-        
         
         self.topologia_completa = {}
         
         self.crear_interfaz()
     
     def crear_interfaz(self):
-        
         main_frame = ttk.Frame(self.ventana, padding=10)
         main_frame.grid(row=0, column=0, sticky="nsew")
-        
         
         self.ventana.columnconfigure(0, weight=1)
         self.ventana.rowconfigure(0, weight=1)
@@ -253,7 +653,7 @@ class HybridNetworkGUI:
         config_frame.columnconfigure(1, weight=1)
         
         
-        ttk.Label(config_frame, text="Modo:").grid(row=0, column=0, sticky="w")
+        ttk.Label(config_frame, text="Comunicación:").grid(row=0, column=0, sticky="w")
         self.modo_var = tk.StringVar(value="local")
         modo_frame = ttk.Frame(config_frame)
         modo_frame.grid(row=0, column=1, sticky="ew")
@@ -264,15 +664,27 @@ class HybridNetworkGUI:
                        value="redis", command=self.cambiar_modo).pack(side="left", padx=(20,0))
         
         
-        ttk.Label(config_frame, text="ID Nodo:").grid(row=1, column=0, sticky="w", pady=(5,0))
+        ttk.Label(config_frame, text="Algoritmo:").grid(row=1, column=0, sticky="w", pady=(5,0))
+        self.algoritmo_var = tk.StringVar(value="flooding")
+        algoritmo_frame = ttk.Frame(config_frame)
+        algoritmo_frame.grid(row=1, column=1, sticky="ew", pady=(5,0))
+        
+        ttk.Radiobutton(algoritmo_frame, text="Flooding", variable=self.algoritmo_var, 
+                       value="flooding").pack(side="left")
+        ttk.Radiobutton(algoritmo_frame, text="Link State", variable=self.algoritmo_var, 
+                       value="link_state").pack(side="left", padx=(20,0))
+        ttk.Radiobutton(algoritmo_frame, text="Distance Vector", variable=self.algoritmo_var, 
+                       value="distance_vector").pack(side="left", padx=(20,0))
+        
+        
+        ttk.Label(config_frame, text="ID Nodo:").grid(row=2, column=0, sticky="w", pady=(5,0))
         self.nodo_entry = ttk.Entry(config_frame, width=10)
-        self.nodo_entry.grid(row=1, column=1, sticky="w", pady=(5,0))
+        self.nodo_entry.grid(row=2, column=1, sticky="w", pady=(5,0))
         self.nodo_entry.insert(0, self.nodo_id)
         
-        
-        ttk.Label(config_frame, text="Vecinos:").grid(row=2, column=0, sticky="w", pady=(5,0))
+        ttk.Label(config_frame, text="Vecinos:").grid(row=3, column=0, sticky="w", pady=(5,0))
         self.vecinos_entry = ttk.Entry(config_frame, width=30)
-        self.vecinos_entry.grid(row=2, column=1, sticky="ew", pady=(5,0))
+        self.vecinos_entry.grid(row=3, column=1, sticky="ew", pady=(5,0))
         self.vecinos_entry.insert(0, ",".join(self.vecinos))
         
         
@@ -295,16 +707,14 @@ class HybridNetworkGUI:
         
         
         botones_config_frame = ttk.Frame(config_frame)
-        botones_config_frame.grid(row=4, column=0, columnspan=2, pady=(10,0))
+        botones_config_frame.grid(row=5, column=0, columnspan=2, pady=(10,0))
         
         ttk.Button(botones_config_frame, text="Cargar Config JSON", 
                   command=self.cargar_configuracion).pack(side="left", padx=(0,5))
-        ttk.Button(botones_config_frame, text="Guardar Config", 
-                  command=self.guardar_configuracion).pack(side="left", padx=(0,5))
         ttk.Button(botones_config_frame, text="Test Redis", 
                   command=self.probar_conectividad_redis).pack(side="left", padx=(0,5))
         ttk.Button(botones_config_frame, text="Conectar", 
-                  command=self.conectar, state="normal").pack(side="left", padx=(0,5))
+                  command=self.conectar).pack(side="left", padx=(0,5))
         self.status_label = ttk.Label(botones_config_frame, text="Desconectado", foreground="red")
         self.status_label.pack(side="left", padx=(10,0))
         
@@ -318,7 +728,7 @@ class HybridNetworkGUI:
         self.destino_combo.grid(row=0, column=1, sticky="w")
         
         ttk.Label(mensaje_frame, text="Tipo:").grid(row=0, column=2, sticky="w", padx=(10,5))
-        self.tipo_combo = ttk.Combobox(mensaje_frame, values=["message", "echo", "hello", "info"], width=10)
+        self.tipo_combo = ttk.Combobox(mensaje_frame, values=["message", "hello", "info", "lsp", "distance_vector"], width=15)
         self.tipo_combo.grid(row=0, column=3, sticky="w")
         self.tipo_combo.set("message")
         
@@ -333,15 +743,14 @@ class HybridNetworkGUI:
         control_frame = ttk.Frame(main_frame)
         control_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0,10))
         
-        ttk.Button(control_frame, text="Ping Vecinos", command=self.ping_vecinos).pack(side="left", padx=(0,5))
-        ttk.Button(control_frame, text="Mensaje Personalizado", command=self.enviar_mensaje_personalizado).pack(side="left", padx=(0,5))
+        ttk.Button(control_frame, text="Mostrar Tabla Enrutamiento", command=self.mostrar_tabla_enrutamiento).pack(side="left", padx=(0,5))
         ttk.Button(control_frame, text="Mostrar Estado", command=self.mostrar_estado).pack(side="left", padx=(0,5))
         ttk.Button(control_frame, text="Limpiar Log", command=self.limpiar_log).pack(side="left", padx=(0,5))
         ttk.Button(control_frame, text="Desconectar", command=self.desconectar).pack(side="right")
         
         
         log_frame = ttk.LabelFrame(main_frame, text="Log de Mensajes", padding=5)
-        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(0,0))
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         main_frame.rowconfigure(3, weight=1)
@@ -354,7 +763,7 @@ class HybridNetworkGUI:
         self.log_text.tag_configure("recibido", foreground="green")
         self.log_text.tag_configure("error", foreground="red")
         self.log_text.tag_configure("sistema", foreground="purple")
-        
+        self.log_text.tag_configure("algoritmo", foreground="orange")
         
         self.cambiar_modo()
     
@@ -362,101 +771,14 @@ class HybridNetworkGUI:
         modo = self.modo_var.get()
         
         if modo == "redis":
-            self.redis_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10,0))
+            self.redis_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10,0))
             self.redis_frame.columnconfigure(1, weight=1)
             self.redis_frame.columnconfigure(3, weight=1)
         else:
             self.redis_frame.grid_remove()
         
-        
         if self.communication_mode:
             self.desconectar()
-    
-    def cargar_configuracion(self):
-        archivo = filedialog.askopenfilename(
-            title="Seleccionar archivo de configuración",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-        )
-        
-        if archivo:
-            try:
-                with open(archivo, 'r') as f:
-                    config = json.load(f)
-                
-                
-                if 'node_id' in config:
-                    self.nodo_entry.delete(0, tk.END)
-                    self.nodo_entry.insert(0, config['node_id'])
-                
-                
-                if 'topology' in config:
-                    self.topologia_completa = config['topology']
-                    if config.get('node_id') in self.topologia_completa:
-                        vecinos = self.topologia_completa[config['node_id']]
-                        self.vecinos_entry.delete(0, tk.END)
-                        self.vecinos_entry.insert(0, ",".join(vecinos))
-                
-                
-                if 'redis' in config:
-                    redis_config = config['redis']
-                    self.redis_host_entry.delete(0, tk.END)
-                    self.redis_host_entry.insert(0, redis_config.get('host', 'localhost'))
-                    
-                    self.redis_port_entry.delete(0, tk.END)
-                    self.redis_port_entry.insert(0, str(redis_config.get('port', 6379)))
-                    
-                    self.redis_pass_entry.delete(0, tk.END)
-                    self.redis_pass_entry.insert(0, redis_config.get('password', ''))
-                    
-                    
-                    self.modo_var.set("redis")
-                    self.cambiar_modo()
-                
-                
-                if 'channels' in config:
-                    self.configuracion_canales = config['channels']
-                
-                
-                if 'message_format' in config:
-                    self.message_format = config['message_format']
-                
-                if 'node_name_format' in config:
-                    self.node_name_format = config['node_name_format']
-                
-                
-                self.configuracion_redis.update(config.get('redis', {}))
-                
-                self.log_mensaje("✓ Configuración completa cargada exitosamente", "sistema")
-                
-                
-                resumen = self.generar_resumen_configuracion(config)
-                self.log_mensaje(resumen, "sistema")
-                
-            except Exception as e:
-                messagebox.showerror("Error", f"Error cargando configuración: {e}")
-                self.log_mensaje(f"✗ Error cargando configuración: {e}", "error")
-    
-    def generar_resumen_configuracion(self, config):
-        resumen = "Configuración cargada:\n"
-        resumen += f"  • Nodo: {config.get('node_id', 'N/A')}\n"
-        resumen += f"  • Formato mensaje: {config.get('message_format', 'N/A')}\n"
-        resumen += f"  • Formato nombre: {config.get('node_name_format', 'N/A')}\n"
-        
-        if 'redis' in config:
-            redis_cfg = config['redis']
-            resumen += f"  • Redis: {redis_cfg.get('host', 'localhost')}:{redis_cfg.get('port', 6379)}\n"
-        
-        if 'channels' in config:
-            channels = config['channels']
-            if 'subscribe' in channels:
-                resumen += f"  • Canales suscritos: {len(channels['subscribe'])}\n"
-            if 'neighbors' in channels:
-                resumen += f"  • Canales vecinos: {len(channels['neighbors'])}\n"
-        
-        if 'topology' in config:
-            resumen += f"  • Nodos en topología: {len(config['topology'])}\n"
-        
-        return resumen
     
     def conectar(self):
         try:
@@ -469,90 +791,73 @@ class HybridNetworkGUI:
                 messagebox.showerror("Error", "ID de nodo requerido")
                 return
             
-            self.log_mensaje(f"[{self.nodo_id}] Iniciando proceso de conexión...", "sistema")
-            
             
             if self.communication_mode:
-                self.log_mensaje(f"[{self.nodo_id}] Cerrando conexión anterior...", "sistema")
                 self.desconectar()
             
             modo = self.modo_var.get()
-            self.log_mensaje(f"[{self.nodo_id}] Modo seleccionado: {modo.upper()}", "sistema")
+            algoritmo = self.algoritmo_var.get()
+            
+            self.log_mensaje(f"[{self.nodo_id}] Conectando en modo {modo.upper()} con algoritmo {algoritmo.upper()}", "sistema")
+            
             
             if modo == "local":
-                puerto = PUERTO_BASE_LOCAL + (ord(self.nodo_id) - ord('A'))
-                self.log_mensaje(f"[{self.nodo_id}] Configurando modo LOCAL en puerto {puerto}", "sistema")
-                
                 self.communication_mode = LocalSocketMode(self.nodo_id)
-                success = self.communication_mode.initialize()
-                if not success:
-                    raise Exception("No se pudo inicializar modo local")
-                
             elif modo == "redis":
-                
                 self.configuracion_redis = {
                     'host': self.redis_host_entry.get().strip(),
                     'port': int(self.redis_port_entry.get().strip()),
                     'password': self.redis_pass_entry.get().strip()
                 }
                 
-                self.log_mensaje(f"[{self.nodo_id}] Configurando REDIS: {self.configuracion_redis['host']}:{self.configuracion_redis['port']}", "sistema")
-                
-                
                 channels_config = None
                 if self.configuracion_canales.get('subscribe') or self.configuracion_canales.get('neighbors'):
                     channels_config = self.configuracion_canales
-                    self.log_mensaje(f"[{self.nodo_id}] Usando configuración de canales desde JSON", "sistema")
-                    self.log_mensaje(f"[{self.nodo_id}] Canales subscribe: {self.configuracion_canales.get('subscribe', [])}", "sistema")
-                    self.log_mensaje(f"[{self.nodo_id}] Canales neighbors: {list(self.configuracion_canales.get('neighbors', {}).keys())}", "sistema")
                 else:
-                    
                     channels_config = {
                         'subscribe': [f"sec20.topologia1.node{self.nodo_id.lower()}"],
                         'neighbors': {vecino: f"sec20.topologia1.node{vecino.lower()}" for vecino in self.vecinos}
                     }
-                    self.log_mensaje(f"[{self.nodo_id}] Generando canales por defecto", "sistema")
-                    for vecino, canal in channels_config['neighbors'].items():
-                        self.log_mensaje(f"[{self.nodo_id}] Canal para {vecino}: {canal}", "sistema")
                 
                 self.communication_mode = RedisMode(self.nodo_id, self.configuracion_redis, channels_config)
-                result = self.communication_mode.initialize()
-                if isinstance(result, tuple) and not result[0]:
-                    raise Exception(result[1])
-                
-                self.log_mensaje(f"[{self.nodo_id}] Conexión Redis establecida exitosamente", "sistema")
             
             
-            self.log_mensaje(f"[{self.nodo_id}] Iniciando listener de mensajes...", "sistema")
+            result = self.communication_mode.initialize()
+            if isinstance(result, tuple) and not result[0]:
+                raise Exception(result[1])
+            
+            
+            if algoritmo == "flooding":
+                self.routing_algorithm = FloodingAlgorithm(self.nodo_id, self.vecinos, self.communication_mode)
+            elif algoritmo == "link_state":
+                self.routing_algorithm = LinkStateAlgorithm(self.nodo_id, self.vecinos, self.communication_mode)
+            elif algoritmo == "distance_vector":
+                self.routing_algorithm = DistanceVectorAlgorithm(self.nodo_id, self.vecinos, self.communication_mode)
+            
+            
             status_msg = self.communication_mode.start_listening(self.procesar_mensaje_recibido)
             
             
+            threading.Thread(target=self.routing_algorithm.send_initial_messages, daemon=True).start()
+            
+            
             self.destino_combo.config(values=self.vecinos)
-            self.status_label.config(text=f"Conectado ({modo})", foreground="green")
+            self.status_label.config(text=f"Conectado ({modo}/{algoritmo})", foreground="green")
             
-            
-            self.log_mensaje(f"[{self.nodo_id}] ✓ CONECTADO como {self.nodo_id} en modo {modo.upper()}", "sistema")
-            self.log_mensaje(f"[{self.nodo_id}] Vecinos configurados: {', '.join(self.vecinos)}", "sistema")
+            self.log_mensaje(f"[{self.nodo_id}] ✓ CONECTADO - {modo.upper()}/{algoritmo.upper()}", "sistema")
+            self.log_mensaje(f"[{self.nodo_id}] Vecinos: {', '.join(self.vecinos)}", "sistema")
             self.log_mensaje(f"[{self.nodo_id}] {status_msg}", "sistema")
-            
-            if modo == "redis":
-                if self.configuracion_canales.get('subscribe'):
-                    for canal in self.configuracion_canales['subscribe']:
-                        self.log_mensaje(f"[{self.nodo_id}] Suscrito a: {canal}", "sistema")
-                        
-                if self.configuracion_canales.get('neighbors'):
-                    self.log_mensaje(f"[{self.nodo_id}] Canales vecinos configurados: {len(self.configuracion_canales['neighbors'])}", "sistema")
-                
-            self.log_mensaje(f"[{self.nodo_id}] Formato mensaje: {self.message_format}", "sistema")
-            self.log_mensaje(f"[{self.nodo_id}] Formato nombre: {self.node_name_format}", "sistema")
-            self.log_mensaje(f"[{self.nodo_id}] ¡Listo para enviar/recibir mensajes!", "sistema")
             
         except Exception as e:
             messagebox.showerror("Error de Conexión", str(e))
             self.status_label.config(text="Error de conexión", foreground="red")
-            self.log_mensaje(f"[{self.nodo_id}] ✗ ERROR DE CONEXIÓN: {e}", "error")
+            self.log_mensaje(f"[{self.nodo_id}] ✗ ERROR: {e}", "error")
     
     def desconectar(self):
+        if self.routing_algorithm:
+            self.routing_algorithm.activo = False
+            self.routing_algorithm = None
+        
         if self.communication_mode:
             self.communication_mode.cleanup()
             self.communication_mode = None
@@ -573,9 +878,8 @@ class HybridNetworkGUI:
             messagebox.showwarning("Advertencia", "Destino y mensaje requeridos")
             return
         
-        
         mensaje = {
-            "proto": "hybrid_gui",
+            "proto": "gui_manual",
             "type": tipo,
             "from": self.nodo_id,
             "to": destino,
@@ -586,7 +890,6 @@ class HybridNetworkGUI:
             },
             "payload": contenido
         }
-        
         
         result = self.communication_mode.send_message(destino, mensaje)
         
@@ -605,11 +908,7 @@ class HybridNetworkGUI:
     
     def procesar_mensaje_recibido(self, datos):
         try:
-            
-            self.log_mensaje(f"[RAW] Recibido: {datos[:150]}{'...' if len(datos) > 150 else ''}", "sistema")
-            
             paquete = json.loads(datos)
-            
             
             origen = paquete.get("from", "desconocido")
             destino = paquete.get("to", "")
@@ -620,94 +919,80 @@ class HybridNetworkGUI:
             msg_id = paquete.get("headers", {}).get("id")
             
             
-            self.log_mensaje(f"[{self.nodo_id}] Paquete recibido: {proto} | {tipo} | {origen} → {destino} | TTL:{ttl}", "recibido")
-            
-            
             if msg_id and msg_id in self.mensajes_recibidos:
-                self.log_mensaje(f"[{self.nodo_id}] Mensaje duplicado ignorado (ID: {msg_id})", "sistema")
                 return
             if msg_id:
                 self.mensajes_recibidos.add(msg_id)
             
             
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            if origen == self.nodo_id:
+                return
             
-            if destino == self.nodo_id:
-                
-                if tipo == "echo":
-                    self.log_mensaje(f"[{self.nodo_id}] ECHO RECIBIDO de {origen}", "recibido")
-                elif tipo == "hello":
-                    self.log_mensaje(f"[{self.nodo_id}] HELLO RECIBIDO de {origen}: {contenido}", "recibido")
-                elif tipo == "info" or tipo == "lsp" or tipo == "distance_vector":
-                    self.log_mensaje(f"[{self.nodo_id}] INFO RECIBIDO de {origen}: {tipo}", "recibido")
-                    
-                    if len(str(contenido)) < 200:
-                        self.log_mensaje(f"[{self.nodo_id}] Contenido: {contenido}", "recibido")
-                elif tipo == "message":
-                    self.log_mensaje(f"[{self.nodo_id}] MENSAJE RECIBIDO de {origen}: '{contenido}'", "recibido")
-                else:
-                    self.log_mensaje(f"[{self.nodo_id}] {tipo.upper()} RECIBIDO de {origen}: {contenido}", "recibido")
+            self.log_mensaje(f"[{self.nodo_id}] Recibido: {proto} | {tipo} | {origen} → {destino} | TTL:{ttl}", "recibido")
             
-            elif destino == "broadcast" or destino.lower() == "broadcast":
-                
-                self.log_mensaje(f"[{self.nodo_id}] BROADCAST de {origen}: {tipo} | {contenido[:50]}{'...' if len(str(contenido)) > 50 else ''}", "recibido")
-                
+            
+            if self.routing_algorithm:
+                resultado = self.routing_algorithm.process_message(paquete)
+                if resultado:
+                    self.log_mensaje(f"[{self.nodo_id}] {resultado}", "algoritmo")
             else:
+                self.log_mensaje(f"[{self.nodo_id}] Sin algoritmo configurado", "error")
                 
-                self.log_mensaje(f"[{self.nodo_id}] TRÁNSITO: {origen} → {destino} | {tipo} | TTL:{ttl}", "sistema")
-                if self.modo_var.get() == "local":
-                    self.log_mensaje(f"[{self.nodo_id}] Contenido en tránsito: {contenido[:100]}{'...' if len(str(contenido)) > 100 else ''}", "sistema")
-            
-            
-            headers = paquete.get("headers", {})
-            if isinstance(headers, dict):
-                headers_info = []
-                for key, value in headers.items():
-                    if key not in ['id', 'timestamp']:  
-                        headers_info.append(f"{key}:{value}")
-                if headers_info:
-                    self.log_mensaje(f"[{self.nodo_id}] Headers: {', '.join(headers_info)}", "sistema")
-            
         except json.JSONDecodeError as e:
-            self.log_mensaje(f"[{self.nodo_id}] ERROR JSON: {datos[:100]}... | {e}", "error")
+            self.log_mensaje(f"[{self.nodo_id}] ERROR JSON: {e}", "error")
         except Exception as e:
-            self.log_mensaje(f"[{self.nodo_id}] ERROR procesando mensaje: {e}", "error")
-            
-            self.log_mensaje(f"[DEBUG] Datos problemáticos: {datos[:200]}{'...' if len(datos) > 200 else ''}", "error")
+            self.log_mensaje(f"[{self.nodo_id}] ERROR procesando: {e}", "error")
     
-    def ping_vecinos(self):
-        if not self.communication_mode:
+    def mostrar_tabla_enrutamiento(self):
+        if not self.routing_algorithm:
             messagebox.showwarning("Advertencia", "No conectado")
             return
         
-        for vecino in self.vecinos:
-            mensaje = {
-                "proto": "hybrid_gui",
-                "type": "hello",
-                "from": self.nodo_id,
-                "to": vecino,
-                "ttl": 1,
-                "headers": {
-                    "id": str(uuid.uuid4())[:8],
-                    "timestamp": datetime.now().isoformat()
-                },
-                "payload": f"Hello desde {self.nodo_id}"
-            }
-            
-            result = self.communication_mode.send_message(vecino, mensaje)
-            if isinstance(result, tuple) and not result[0]:
-                self.log_mensaje(f"✗ Error ping a {vecino}: {result[1]}", "error")
+        algoritmo_nombre = self.routing_algorithm.get_algorithm_name()
         
-        self.log_mensaje(f"Ping enviado a {len(self.vecinos)} vecinos", "sistema")
+        if hasattr(self.routing_algorithm, 'tabla_enrutamiento'):
+            tabla = self.routing_algorithm.tabla_enrutamiento
+            
+            texto = f"\n[{self.nodo_id}] TABLA DE ENRUTAMIENTO - {algoritmo_nombre.upper()}:\n"
+            texto += "-" * 60 + "\n"
+            
+            if algoritmo_nombre == "link_state":
+                texto += "Destino | Siguiente Salto | Distancia\n"
+                texto += "-" * 60 + "\n"
+                
+                for destino, info in sorted(tabla.items()):
+                    texto += f"{destino:^7} | {info['next_hop']:^14} | {info['distance']:^9}\n"
+                    
+            elif algoritmo_nombre == "distance_vector":
+                texto += "Destino | Distancia | Siguiente Salto\n"
+                texto += "-" * 60 + "\n"
+                
+                for destino, info in sorted(tabla.items()):
+                    distancia = info['distance']
+                    siguiente = info['next_hop']
+                    distancia_str = str(distancia) if distancia < MAX_DISTANCIA else "∞"
+                    texto += f"{destino:^7} | {distancia_str:^9} | {siguiente:^14}\n"
+            
+            texto += "-" * 60
+            self.log_mensaje(texto, "sistema")
+        else:
+            self.log_mensaje(f"[{self.nodo_id}] Algoritmo {algoritmo_nombre} no tiene tabla de enrutamiento", "sistema")
     
     def mostrar_estado(self):
         modo = self.modo_var.get()
+        algoritmo = self.algoritmo_var.get()
+        
         estado = f"Estado del Nodo: {self.nodo_id}\n"
         estado += f"Modo: {modo.upper()}\n"
+        estado += f"Algoritmo: {algoritmo.upper()}\n"
         estado += f"Vecinos: {', '.join(self.vecinos)}\n"
         estado += f"Mensajes recibidos: {len(self.mensajes_recibidos)}\n"
-        estado += f"Formato mensaje: {self.message_format}\n"
-        estado += f"Formato nombre: {self.node_name_format}\n"
+        
+        
+        message_format = getattr(self, 'message_format', 'flexible')
+        node_name_format = getattr(self, 'node_name_format', 'letters')
+        estado += f"Formato mensaje: {message_format}\n"
+        estado += f"Formato nombre: {node_name_format}\n"
         
         if modo == "redis":
             estado += f"\nConfiguración Redis:\n"
@@ -734,47 +1019,65 @@ class HybridNetworkGUI:
             for nodo, vecinos_nodo in self.topologia_completa.items():
                 estado += f"  • {nodo}: {', '.join(vecinos_nodo)}\n"
         
+        if self.routing_algorithm:
+            estado += f"\nAlgoritmo activo: {self.routing_algorithm.get_algorithm_name()}\n"
+            if hasattr(self.routing_algorithm, 'tabla_enrutamiento'):
+                estado += f"Entradas en tabla: {len(self.routing_algorithm.tabla_enrutamiento)}\n"
+        
         self.log_mensaje(estado, "sistema")
     
-    def guardar_configuracion(self):
-        archivo = filedialog.asksaveasfilename(
-            title="Guardar configuración",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            defaultextension=".json"
+    def cargar_configuracion(self):
+        archivo = filedialog.askopenfilename(
+            title="Seleccionar archivo de configuración",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
         )
         
         if archivo:
             try:
-                config = {
-                    "node_id": self.nodo_id,
-                    "message_format": self.message_format,
-                    "node_name_format": self.node_name_format,
-                    "redis": self.configuracion_redis,
-                    "channels": self.configuracion_canales,
-                    "topology": self.topologia_completa if self.topologia_completa else {
-                        self.nodo_id: self.vecinos
-                    }
-                }
+                with open(archivo, 'r') as f:
+                    config = json.load(f)
                 
-                with open(archivo, 'w') as f:
-                    json.dump(config, f, indent=2)
+                if 'node_id' in config:
+                    self.nodo_entry.delete(0, tk.END)
+                    self.nodo_entry.insert(0, config['node_id'])
                 
-                self.log_mensaje(f"✓ Configuración guardada en: {archivo}", "sistema")
+                if 'topology' in config:
+                    self.topologia_completa = config['topology']
+                    if config.get('node_id') in self.topologia_completa:
+                        vecinos = self.topologia_completa[config['node_id']]
+                        self.vecinos_entry.delete(0, tk.END)
+                        self.vecinos_entry.insert(0, ",".join(vecinos))
+                
+                if 'redis' in config:
+                    redis_config = config['redis']
+                    self.redis_host_entry.delete(0, tk.END)
+                    self.redis_host_entry.insert(0, redis_config.get('host', 'localhost'))
+                    
+                    self.redis_port_entry.delete(0, tk.END)
+                    self.redis_port_entry.insert(0, str(redis_config.get('port', 6379)))
+                    
+                    self.redis_pass_entry.delete(0, tk.END)
+                    self.redis_pass_entry.insert(0, redis_config.get('password', ''))
+                    
+                    self.modo_var.set("redis")
+                    self.cambiar_modo()
+                
+                if 'channels' in config:
+                    self.configuracion_canales = config['channels']
+                
+                self.configuracion_redis.update(config.get('redis', {}))
+                
+                self.log_mensaje("✓ Configuración cargada exitosamente", "sistema")
                 
             except Exception as e:
-                messagebox.showerror("Error", f"Error guardando configuración: {e}")
-                self.log_mensaje(f"✗ Error guardando configuración: {e}", "error")
+                messagebox.showerror("Error", f"Error cargando configuración: {e}")
     
     def probar_conectividad_redis(self):
-        if not self.configuracion_redis:
-            messagebox.showwarning("Advertencia", "No hay configuración de Redis cargada")
-            return
-            
         try:
             test_client = redis.Redis(
-                host=self.configuracion_redis['host'],
-                port=self.configuracion_redis['port'],
-                password=self.configuracion_redis['password'],
+                host=self.redis_host_entry.get().strip(),
+                port=int(self.redis_port_entry.get().strip()),
+                password=self.redis_pass_entry.get().strip(),
                 decode_responses=True,
                 socket_timeout=5
             )
@@ -789,93 +1092,6 @@ class HybridNetworkGUI:
             self.log_mensaje(f"✗ Error conectividad Redis: {e}", "error")
             messagebox.showerror("Error", f"No se pudo conectar a Redis: {e}")
     
-    def enviar_mensaje_personalizado(self):
-        if not self.communication_mode:
-            messagebox.showwarning("Advertencia", "No conectado")
-            return
-        
-        
-        ventana_msg = tk.Toplevel(self.ventana)
-        ventana_msg.title("Mensaje Personalizado")
-        ventana_msg.geometry("500x400")
-        ventana_msg.transient(self.ventana)
-        
-        frame = ttk.Frame(ventana_msg, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
-        ventana_msg.columnconfigure(0, weight=1)
-        ventana_msg.rowconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
-        
-        
-        ttk.Label(frame, text="Destino:").grid(row=0, column=0, sticky="w")
-        destino_entry = ttk.Entry(frame, width=20)
-        destino_entry.grid(row=0, column=1, sticky="ew", pady=(0,5))
-        
-        ttk.Label(frame, text="Tipo:").grid(row=1, column=0, sticky="w")
-        tipo_entry = ttk.Entry(frame, width=20)
-        tipo_entry.grid(row=1, column=1, sticky="ew", pady=(0,5))
-        tipo_entry.insert(0, "message")
-        
-        ttk.Label(frame, text="TTL:").grid(row=2, column=0, sticky="w")
-        ttl_entry = ttk.Entry(frame, width=20)
-        ttl_entry.grid(row=2, column=1, sticky="ew", pady=(0,5))
-        ttl_entry.insert(0, "5")
-        
-        ttk.Label(frame, text="Headers (JSON):").grid(row=3, column=0, sticky="nw")
-        headers_text = scrolledtext.ScrolledText(frame, width=50, height=5)
-        headers_text.grid(row=3, column=1, sticky="ew", pady=(0,5))
-        headers_text.insert(tk.END, '{"custom": "value"}')
-        
-        ttk.Label(frame, text="Payload:").grid(row=4, column=0, sticky="nw")
-        payload_text = scrolledtext.ScrolledText(frame, width=50, height=8)
-        payload_text.grid(row=4, column=1, sticky="ew", pady=(0,10))
-        frame.rowconfigure(4, weight=1)
-        
-        def enviar_personalizado():
-            try:
-                headers_json = json.loads(headers_text.get(1.0, tk.END))
-                headers_json.update({
-                    "id": str(uuid.uuid4())[:8],
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                mensaje = {
-                    "proto": "hybrid_gui_custom",
-                    "type": tipo_entry.get(),
-                    "from": self.nodo_id,
-                    "to": destino_entry.get().upper(),
-                    "ttl": int(ttl_entry.get()),
-                    "headers": headers_json,
-                    "payload": payload_text.get(1.0, tk.END).strip()
-                }
-                
-                result = self.communication_mode.send_message(destino_entry.get().upper(), mensaje)
-                
-                if isinstance(result, tuple):
-                    success, error = result
-                    if success:
-                        self.log_mensaje(f"→ Mensaje personalizado enviado a {destino_entry.get()}", "enviado")
-                        ventana_msg.destroy()
-                    else:
-                        messagebox.showerror("Error", f"Error enviando: {error}")
-                elif result:
-                    self.log_mensaje(f"→ Mensaje personalizado enviado a {destino_entry.get()}", "enviado")
-                    ventana_msg.destroy()
-                else:
-                    messagebox.showerror("Error", "Error enviando mensaje")
-                    
-            except json.JSONDecodeError:
-                messagebox.showerror("Error", "Headers debe ser JSON válido")
-            except Exception as e:
-                messagebox.showerror("Error", f"Error: {e}")
-        
-        
-        botones_frame = ttk.Frame(frame)
-        botones_frame.grid(row=5, column=0, columnspan=2, pady=(10,0))
-        
-        ttk.Button(botones_frame, text="Enviar", command=enviar_personalizado).pack(side="left", padx=(0,5))
-        ttk.Button(botones_frame, text="Cancelar", command=ventana_msg.destroy).pack(side="left")
-    
     def limpiar_log(self):
         self.log_text.delete(1.0, tk.END)
         self.mensajes_recibidos.clear()
@@ -883,7 +1099,6 @@ class HybridNetworkGUI:
     def log_mensaje(self, mensaje, categoria="normal"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         mensaje_completo = f"[{timestamp}] {mensaje}\n"
-        
         
         self.log_text.insert(tk.END, mensaje_completo, categoria)
         self.log_text.see(tk.END)
@@ -901,6 +1116,8 @@ class HybridNetworkGUI:
             self.cerrar_aplicacion()
     
     def cerrar_aplicacion(self):
+        if self.routing_algorithm:
+            self.routing_algorithm.activo = False
         if self.communication_mode:
             self.desconectar()
         self.ventana.quit()
@@ -909,14 +1126,11 @@ class HybridNetworkGUI:
 def main():
     import sys
     
-    
     nodo_inicial = sys.argv[1].upper() if len(sys.argv) > 1 else "A"
     vecinos_inicial = sys.argv[2].split(",") if len(sys.argv) > 2 else ["B", "C", "D"]
     vecinos_inicial = [v.strip().upper() for v in vecinos_inicial]
     
-    
-    gui = HybridNetworkGUI()
-    
+    gui = EnhancedNetworkGUI()
     
     gui.nodo_entry.delete(0, tk.END)
     gui.nodo_entry.insert(0, nodo_inicial)
@@ -925,8 +1139,6 @@ def main():
     gui.vecinos_entry.insert(0, ",".join(vecinos_inicial))
     
     gui.log_mensaje(f"GUI iniciada - Nodo: {nodo_inicial}, Vecinos: {', '.join(vecinos_inicial)}", "sistema")
-    gui.log_mensaje("Selecciona modo y presiona 'Conectar' para comenzar", "sistema")
-    
     
     gui.iniciar()
 
