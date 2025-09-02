@@ -23,7 +23,6 @@ def safe_get_header_value(headers, key, default=None):
     if isinstance(headers, dict):
         return headers.get(key, default)
     elif isinstance(headers, list):
-        
         if key == "path":
             return headers  
         elif key == "msg_id" or key == "id":
@@ -35,17 +34,13 @@ def safe_get_header_value(headers, key, default=None):
 
 def safe_get_msg_id(paquete):
     headers = paquete.get("headers", [])
-    
-    
     msg_id = safe_get_header_value(headers, "msg_id")
     if not msg_id:
         msg_id = safe_get_header_value(headers, "id")  
-    
     return msg_id
 
 def safe_get_path(paquete):
     headers = paquete.get("headers", [])
-    
     if isinstance(headers, dict):
         return headers.get("path", [])
     elif isinstance(headers, list):
@@ -117,7 +112,6 @@ class LocalSocketMode(CommunicationMode):
     
     def send_message(self, destino, mensaje):
         try:
-            
             mensaje_con_protocolo = mensaje.copy()
             mensaje_con_protocolo["proto"] = self.protocol_name
             
@@ -301,7 +295,6 @@ class FloodingAlgorithm(RoutingAlgorithm):
             return "TTL agotado, mensaje descartado"
     
     def flood_message(self, mensaje, origen=None):
-        
         mensaje["proto"] = self.get_protocol_name()
         
         if isinstance(self.communication_mode, RedisMode):
@@ -333,6 +326,7 @@ class LinkStateAlgorithm(RoutingAlgorithm):
         self.tabla_enrutamiento = {}
         self.secuencia_lsp = 0
         self.lock = threading.Lock()
+        self.vecinos_detectados = set()
         
         self.generar_lsp_propio()
         threading.Thread(target=self.envio_periodico_lsp, daemon=True).start()
@@ -361,8 +355,17 @@ class LinkStateAlgorithm(RoutingAlgorithm):
         contenido = paquete.get("payload", "")
         ttl = paquete.get("ttl", 0)
         
-        if tipo == "lsp":
+        
+        if origen in self.vecinos and origen != self.nodo_id:
+            if origen not in self.vecinos_detectados:
+                self.vecinos_detectados.add(origen)
+        
+        
+        if tipo == "lsp" or tipo == "info":
             return self.procesar_lsp(paquete)
+        elif tipo == "hello":
+            self.vecinos_detectados.add(origen)
+            return f"HELLO procesado de {origen}"
         elif tipo == "message":
             if destino == self.nodo_id:
                 return f"MENSAJE RECIBIDO de {origen}: '{contenido}'"
@@ -375,10 +378,27 @@ class LinkStateAlgorithm(RoutingAlgorithm):
     
     def procesar_lsp(self, paquete):
         payload = paquete.get("payload", {})
-        nodo_origen = payload.get("nodo_origen", paquete.get("from"))
-        secuencia = payload.get("secuencia", 1)
-        vecinos = payload.get("vecinos", [])
-        timestamp = payload.get("timestamp", time.time())
+        
+        
+        if isinstance(payload, dict):
+            nodo_origen = payload.get("nodo_origen", paquete.get("from"))
+            secuencia = payload.get("secuencia", payload.get("sequence", 1))
+            vecinos = payload.get("vecinos", payload.get("neighbors", []))
+            timestamp = payload.get("timestamp", time.time())
+        else:
+            nodo_origen = paquete.get("from")
+            secuencia = 1
+            vecinos = []
+            timestamp = time.time()
+            
+            
+            try:
+                if isinstance(payload, str):
+                    payload_data = json.loads(payload)
+                    vecinos = payload_data.get("vecinos", payload_data.get("neighbors", []))
+                    secuencia = payload_data.get("secuencia", payload_data.get("sequence", 1))
+            except:
+                pass
         
         with self.lock:
             lsp_nuevo = (nodo_origen not in self.lsdb or 
@@ -393,9 +413,10 @@ class LinkStateAlgorithm(RoutingAlgorithm):
                 
                 self.calcular_dijkstra()
                 
+                
                 if paquete.get("ttl", 0) > 1:
                     paquete["ttl"] = paquete["ttl"] - 1
-                    paquete["proto"] = self.get_protocol_name()  
+                    paquete["proto"] = self.get_protocol_name()
                     if isinstance(self.communication_mode, RedisMode):
                         self.communication_mode.broadcast_message(paquete)
                     else:
@@ -403,19 +424,22 @@ class LinkStateAlgorithm(RoutingAlgorithm):
                             if vecino != paquete.get("from"):
                                 self.communication_mode.send_message(vecino, paquete)
                 
-                return f"LSP de {nodo_origen} procesado y reenviado"
+                return f"LSP/INFO de {nodo_origen} procesado y reenviado"
             else:
-                return f"LSP de {nodo_origen} ignorado (más antiguo)"
+                return f"LSP/INFO de {nodo_origen} ignorado (más antiguo)"
     
     def calcular_dijkstra(self):
         grafo = defaultdict(dict)
         
+        
         for nodo, info in self.lsdb.items():
-            for vecino in info.get('vecinos', []):
+            vecinos_nodo = info.get('vecinos', [])
+            for vecino in vecinos_nodo:
                 grafo[nodo][vecino] = 1
         
         if not grafo or self.nodo_id not in grafo:
             return
+        
         
         distancias = {nodo: float('inf') for nodo in grafo}
         distancias[self.nodo_id] = 0
@@ -438,6 +462,7 @@ class LinkStateAlgorithm(RoutingAlgorithm):
                         distancias[vecino] = nueva_dist
                         predecesores[vecino] = nodo_actual
                         heapq.heappush(cola, (nueva_dist, vecino))
+        
         
         nueva_tabla = {}
         for destino, dist in distancias.items():
@@ -472,7 +497,7 @@ class LinkStateAlgorithm(RoutingAlgorithm):
             
             mensaje_lsp = {
                 "proto": self.get_protocol_name(),
-                "type": "lsp",
+                "type": "info",
                 "from": self.nodo_id,
                 "to": "broadcast",
                 "ttl": 15,
@@ -507,6 +532,22 @@ class LinkStateAlgorithm(RoutingAlgorithm):
         time.sleep(2)
         self.enviar_lsp()
         
+        
+        time.sleep(1)
+        hello_msg = {
+            "proto": self.get_protocol_name(),
+            "type": "hello",
+            "from": self.nodo_id,
+            "to": "broadcast",
+            "ttl": 1,
+            "headers": {"id": str(uuid.uuid4())[:8]},
+            "payload": "hello_from_" + self.nodo_id
+        }
+        
+        if isinstance(self.communication_mode, RedisMode):
+            self.communication_mode.broadcast_message(hello_msg)
+        
+        
         if self.nodo_id == "A":
             time.sleep(10)
             
@@ -525,6 +566,9 @@ class LinkStateAlgorithm(RoutingAlgorithm):
             
             if "D" in self.tabla_enrutamiento:
                 self.reenviar_mensaje("D", mensaje)
+            else:
+                if isinstance(self.communication_mode, RedisMode):
+                    self.communication_mode.broadcast_message(mensaje)
 
 class DistanceVectorAlgorithm(RoutingAlgorithm):
     def __init__(self, nodo_id, vecinos, communication_mode):
@@ -621,7 +665,6 @@ class DistanceVectorAlgorithm(RoutingAlgorithm):
                 if info['distance'] < MAX_DISTANCIA:
                     vector_distancias[destino] = info['distance']
         
-        
         mensaje = {
             "proto": self.get_protocol_name(),
             "type": "distance_vector",
@@ -679,13 +722,11 @@ class EnhancedNetworkGUI:
         self.ventana.title("Router GUI")
         self.ventana.geometry("900x750")
         
-        
         self.nodo_id = "A"
         self.vecinos = ["B", "C", "D"]
         self.communication_mode = None
         self.routing_algorithm = None
         self.mensajes_recibidos = set()
-        
         
         self.configuracion_redis = {
             'host': 'localhost',
@@ -704,10 +745,8 @@ class EnhancedNetworkGUI:
     
     def crear_mensaje_compatible(self, tipo, destino, contenido, protocolo):
         if protocolo == "flooding":
-            
             headers = [self.nodo_id]
         else:
-            
             headers = {
                 "id": str(uuid.uuid4())[:8],
                 "timestamp": datetime.now().isoformat(),
@@ -732,11 +771,9 @@ class EnhancedNetworkGUI:
         self.ventana.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
         
-        
         config_frame = ttk.LabelFrame(main_frame, text="Configuración", padding=10)
         config_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,10))
         config_frame.columnconfigure(1, weight=1)
-        
         
         ttk.Label(config_frame, text="Comunicación:").grid(row=0, column=0, sticky="w")
         self.modo_var = tk.StringVar(value="local")
@@ -747,7 +784,6 @@ class EnhancedNetworkGUI:
                        value="local", command=self.cambiar_modo).pack(side="left")
         ttk.Radiobutton(modo_frame, text="Redis", variable=self.modo_var, 
                        value="redis", command=self.cambiar_modo).pack(side="left", padx=(20,0))
-        
         
         ttk.Label(config_frame, text="Algoritmo:").grid(row=1, column=0, sticky="w", pady=(5,0))
         self.algoritmo_var = tk.StringVar(value="flooding")
@@ -761,7 +797,6 @@ class EnhancedNetworkGUI:
         ttk.Radiobutton(algoritmo_frame, text="Distance Vector", variable=self.algoritmo_var, 
                        value="distance_vector").pack(side="left", padx=(20,0))
         
-        
         ttk.Label(config_frame, text="ID Nodo:").grid(row=2, column=0, sticky="w", pady=(5,0))
         self.nodo_entry = ttk.Entry(config_frame, width=10)
         self.nodo_entry.grid(row=2, column=1, sticky="w", pady=(5,0))
@@ -771,7 +806,6 @@ class EnhancedNetworkGUI:
         self.vecinos_entry = ttk.Entry(config_frame, width=30)
         self.vecinos_entry.grid(row=3, column=1, sticky="ew", pady=(5,0))
         self.vecinos_entry.insert(0, ",".join(self.vecinos))
-        
         
         self.redis_frame = ttk.LabelFrame(config_frame, text="Configuración Redis")
         
@@ -790,7 +824,6 @@ class EnhancedNetworkGUI:
         self.redis_pass_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(5,0), padx=(0,10))
         self.redis_pass_entry.insert(0, self.configuracion_redis['password'])
         
-        
         botones_config_frame = ttk.Frame(config_frame)
         botones_config_frame.grid(row=5, column=0, columnspan=2, pady=(10,0))
         
@@ -802,7 +835,6 @@ class EnhancedNetworkGUI:
                   command=self.conectar).pack(side="left", padx=(0,5))
         self.status_label = ttk.Label(botones_config_frame, text="Desconectado", foreground="red")
         self.status_label.pack(side="left", padx=(10,0))
-        
         
         mensaje_frame = ttk.LabelFrame(main_frame, text="Enviar Mensaje", padding=10)
         mensaje_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0,10))
@@ -824,7 +856,6 @@ class EnhancedNetworkGUI:
         
         ttk.Button(mensaje_frame, text="Enviar", command=self.enviar_mensaje).grid(row=1, column=3, pady=(5,0), padx=(5,0))
         
-        
         control_frame = ttk.Frame(main_frame)
         control_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0,10))
         
@@ -832,7 +863,6 @@ class EnhancedNetworkGUI:
         ttk.Button(control_frame, text="Mostrar Estado", command=self.mostrar_estado).pack(side="left", padx=(0,5))
         ttk.Button(control_frame, text="Limpiar Log", command=self.limpiar_log).pack(side="left", padx=(0,5))
         ttk.Button(control_frame, text="Desconectar", command=self.desconectar).pack(side="right")
-        
         
         log_frame = ttk.LabelFrame(main_frame, text="Log de Mensajes", padding=5)
         log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
@@ -842,7 +872,6 @@ class EnhancedNetworkGUI:
         
         self.log_text = scrolledtext.ScrolledText(log_frame, width=80, height=20, wrap=tk.WORD)
         self.log_text.grid(row=0, column=0, sticky="nsew")
-        
         
         self.log_text.tag_configure("enviado", foreground="blue")
         self.log_text.tag_configure("recibido", foreground="green")
@@ -867,7 +896,6 @@ class EnhancedNetworkGUI:
     
     def conectar(self):
         try:
-            
             self.nodo_id = self.nodo_entry.get().strip().upper()
             vecinos_str = self.vecinos_entry.get().strip()
             self.vecinos = [v.strip().upper() for v in vecinos_str.split(",") if v.strip()]
@@ -876,7 +904,6 @@ class EnhancedNetworkGUI:
                 messagebox.showerror("Error", "ID de nodo requerido")
                 return
             
-            
             if self.communication_mode:
                 self.desconectar()
             
@@ -884,7 +911,6 @@ class EnhancedNetworkGUI:
             algoritmo = self.algoritmo_var.get()
             
             self.log_mensaje(f"[{self.nodo_id}] Conectando en modo {modo.upper()} con algoritmo {algoritmo.upper()}", "sistema")
-            
             
             if modo == "local":
                 self.communication_mode = LocalSocketMode(self.nodo_id)
@@ -905,12 +931,11 @@ class EnhancedNetworkGUI:
                     }
                 
                 self.communication_mode = RedisMode(self.nodo_id, self.configuracion_redis, channels_config)
-            
+                self.communication_mode.set_neighbor_channels(self.vecinos)
             
             result = self.communication_mode.initialize()
             if isinstance(result, tuple) and not result[0]:
                 raise Exception(result[1])
-            
             
             if algoritmo == "flooding":
                 self.routing_algorithm = FloodingAlgorithm(self.nodo_id, self.vecinos, self.communication_mode)
@@ -919,18 +944,14 @@ class EnhancedNetworkGUI:
             elif algoritmo == "distance_vector":
                 self.routing_algorithm = DistanceVectorAlgorithm(self.nodo_id, self.vecinos, self.communication_mode)
             
-            
             if hasattr(self.routing_algorithm, 'get_protocol_name'):
                 protocol_name = self.routing_algorithm.get_protocol_name()
                 self.communication_mode.set_protocol(protocol_name)
                 self.log_mensaje(f"[{self.nodo_id}] Protocolo configurado: {protocol_name}", "sistema")
             
-            
             status_msg = self.communication_mode.start_listening(self.procesar_mensaje_recibido)
             
-            
             threading.Thread(target=self.routing_algorithm.send_initial_messages, daemon=True).start()
-            
             
             self.destino_combo.config(values=self.vecinos)
             self.status_label.config(text=f"Conectado ({modo}/{algoritmo})", foreground="green")
@@ -969,11 +990,9 @@ class EnhancedNetworkGUI:
             messagebox.showwarning("Advertencia", "Destino y mensaje requeridos")
             return
         
-        
         protocol_name = "gui_manual"  
         if hasattr(self.routing_algorithm, 'get_protocol_name'):
             protocol_name = self.routing_algorithm.get_protocol_name()
-        
         
         mensaje = self.crear_mensaje_compatible(tipo, destino, contenido, protocol_name)
         
@@ -1003,21 +1022,17 @@ class EnhancedNetworkGUI:
             ttl = paquete.get("ttl", 0)
             proto = paquete.get("proto", "unknown")
             
-            
             msg_id = safe_get_msg_id(paquete)
-            
             
             if msg_id and msg_id in self.mensajes_recibidos:
                 return
             if msg_id:
                 self.mensajes_recibidos.add(msg_id)
             
-            
             if origen == self.nodo_id:
                 return
             
             self.log_mensaje(f"[{self.nodo_id}] Recibido: {proto} | {tipo} | {origen} → {destino} | TTL:{ttl}", "recibido")
-            
             
             if self.routing_algorithm:
                 resultado = self.routing_algorithm.process_message(paquete)
@@ -1032,8 +1047,12 @@ class EnhancedNetworkGUI:
             self.log_mensaje(f"[{self.nodo_id}] ERROR procesando: {e}", "error")
     
     def mostrar_tabla_enrutamiento(self):
-        if not self.routing_algorithm:
+        if not self.communication_mode:
             messagebox.showwarning("Advertencia", "No conectado")
+            return
+        
+        if not self.routing_algorithm:
+            self.log_mensaje("No hay algoritmo de enrutamiento configurado", "error")
             return
         
         algoritmo_nombre = self.routing_algorithm.get_algorithm_name()
@@ -1044,22 +1063,31 @@ class EnhancedNetworkGUI:
             texto = f"\n[{self.nodo_id}] TABLA DE ENRUTAMIENTO - {algoritmo_nombre.upper()}:\n"
             texto += "-" * 60 + "\n"
             
-            if algoritmo_nombre == "link_state":
-                texto += "Destino | Siguiente Salto | Distancia\n"
-                texto += "-" * 60 + "\n"
-                
-                for destino, info in sorted(tabla.items()):
-                    texto += f"{destino:^7} | {info['next_hop']:^14} | {info['distance']:^9}\n"
+            if not tabla:
+                texto += "*** TABLA VACÍA ***\n"
+                if hasattr(self.routing_algorithm, 'lsdb'):
+                    lsdb = self.routing_algorithm.lsdb
+                    texto += f"LSDB contiene: {len(lsdb)} entradas: {list(lsdb.keys())}\n"
+                    if hasattr(self.routing_algorithm, 'vecinos_detectados'):
+                        texto += f"Vecinos detectados: {list(self.routing_algorithm.vecinos_detectados)}\n"
                     
-            elif algoritmo_nombre == "distance_vector":
-                texto += "Destino | Distancia | Siguiente Salto\n"
-                texto += "-" * 60 + "\n"
-                
-                for destino, info in sorted(tabla.items()):
-                    distancia = info['distance']
-                    siguiente = info['next_hop']
-                    distancia_str = str(distancia) if distancia < MAX_DISTANCIA else "∞"
-                    texto += f"{destino:^7} | {distancia_str:^9} | {siguiente:^14}\n"
+            else:
+                if algoritmo_nombre == "link_state":
+                    texto += "Destino | Siguiente Salto | Distancia\n"
+                    texto += "-" * 60 + "\n"
+                    
+                    for destino, info in sorted(tabla.items()):
+                        texto += f"{destino:^7} | {info['next_hop']:^14} | {info['distance']:^9}\n"
+                        
+                elif algoritmo_nombre == "distance_vector":
+                    texto += "Destino | Distancia | Siguiente Salto\n"
+                    texto += "-" * 60 + "\n"
+                    
+                    for destino, info in sorted(tabla.items()):
+                        distancia = info['distance']
+                        siguiente = info['next_hop']
+                        distancia_str = str(distancia) if distancia < MAX_DISTANCIA else "∞"
+                        texto += f"{destino:^7} | {distancia_str:^9} | {siguiente:^14}\n"
             
             texto += "-" * 60
             self.log_mensaje(texto, "sistema")
@@ -1074,18 +1102,24 @@ class EnhancedNetworkGUI:
         estado += f"Modo: {modo.upper()}\n"
         estado += f"Algoritmo: {algoritmo.upper()}\n"
         
+        if self.routing_algorithm:
+            if hasattr(self.routing_algorithm, 'get_protocol_name'):
+                estado += f"Protocolo: {self.routing_algorithm.get_protocol_name()}\n"
+            
+            if hasattr(self.routing_algorithm, 'lsdb'):
+                estado += f"LSDB entradas: {len(self.routing_algorithm.lsdb)}\n"
+            
+            if hasattr(self.routing_algorithm, 'vecinos_detectados'):
+                estado += f"Vecinos detectados: {list(self.routing_algorithm.vecinos_detectados)}\n"
+            
+            if hasattr(self.routing_algorithm, 'tabla_enrutamiento'):
+                tabla = self.routing_algorithm.tabla_enrutamiento
+                estado += f"Rutas en tabla: {len(tabla)}\n"
+                if tabla:
+                    estado += "Destinos alcanzables: " + ", ".join(tabla.keys()) + "\n"
         
-        if self.routing_algorithm and hasattr(self.routing_algorithm, 'get_protocol_name'):
-            estado += f"Protocolo: {self.routing_algorithm.get_protocol_name()}\n"
-        
-        estado += f"Vecinos: {', '.join(self.vecinos)}\n"
+        estado += f"Vecinos configurados: {', '.join(self.vecinos)}\n"
         estado += f"Mensajes recibidos: {len(self.mensajes_recibidos)}\n"
-        
-        
-        message_format = getattr(self, 'message_format', 'flexible')
-        node_name_format = getattr(self, 'node_name_format', 'letters')
-        estado += f"Formato mensaje: {message_format}\n"
-        estado += f"Formato nombre: {node_name_format}\n"
         
         if modo == "redis":
             estado += f"\nConfiguración Redis:\n"
@@ -1093,14 +1127,9 @@ class EnhancedNetworkGUI:
             estado += f"  Puerto: {self.configuracion_redis['port']}\n"
             estado += f"  Password: {'*' * len(self.configuracion_redis.get('password', ''))}\n"
             
-            if self.configuracion_canales.get('subscribe'):
-                estado += f"\nCanales suscritos: {len(self.configuracion_canales['subscribe'])}\n"
-                for canal in self.configuracion_canales['subscribe']:
-                    estado += f"  • {canal}\n"
-            
-            if self.configuracion_canales.get('neighbors'):
-                estado += f"\nCanales vecinos: {len(self.configuracion_canales['neighbors'])}\n"
-                for vecino, canal in self.configuracion_canales['neighbors'].items():
+            if hasattr(self.communication_mode, 'canales_vecinos'):
+                estado += f"\nCanales vecinos configurados: {len(self.communication_mode.canales_vecinos)}\n"
+                for vecino, canal in self.communication_mode.canales_vecinos.items():
                     estado += f"  • {vecino} → {canal}\n"
                     
         elif modo == "local":
@@ -1111,11 +1140,6 @@ class EnhancedNetworkGUI:
             estado += f"\nTopología completa:\n"
             for nodo, vecinos_nodo in self.topologia_completa.items():
                 estado += f"  • {nodo}: {', '.join(vecinos_nodo)}\n"
-        
-        if self.routing_algorithm:
-            estado += f"\nAlgoritmo activo: {self.routing_algorithm.get_algorithm_name()}\n"
-            if hasattr(self.routing_algorithm, 'tabla_enrutamiento'):
-                estado += f"Entradas en tabla: {len(self.routing_algorithm.tabla_enrutamiento)}\n"
         
         self.log_mensaje(estado, "sistema")
     
@@ -1195,7 +1219,6 @@ class EnhancedNetworkGUI:
         
         self.log_text.insert(tk.END, mensaje_completo, categoria)
         self.log_text.see(tk.END)
-        
         
         lines = int(self.log_text.index('end-1c').split('.')[0])
         if lines > 1000:

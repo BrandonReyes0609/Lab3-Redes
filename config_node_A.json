@@ -6,18 +6,16 @@
     "password": "UVGRedis2025"
   },
   "channels": {
-    "subscribe": ["sec20.topologia1.node5"],
+    "subscribe": ["sec20.topologia1.nodea"],
     "neighbors": {
-      "B": "sec20.topologia1.node2",
-      "C": "sec20.topologia1.node5.test3"
+      "B": "sec20.topologia1.nodeb",
+      "C": "sec20.topologia1.nodec"
     }
   },
   "message_format": "flexible",
   "node_name_format": "letters",
   "topology": {
     "A": ["B", "C"],
-    "B": ["A", "D"],
-    "C": ["A", "D"],
-    "D": ["B", "C"]
-  }
+    "B": ["A", "C"],
+    "C": ["A", "B"]  }
 }
