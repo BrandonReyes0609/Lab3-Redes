@@ -19,6 +19,39 @@ INTERVALO_LSP = 30
 INTERVALO_DV = 10
 MAX_DISTANCIA = 16
 
+def safe_get_header_value(headers, key, default=None):
+    if isinstance(headers, dict):
+        return headers.get(key, default)
+    elif isinstance(headers, list):
+        
+        if key == "path":
+            return headers  
+        elif key == "msg_id" or key == "id":
+            return None  
+        else:
+            return default
+    else:
+        return default
+
+def safe_get_msg_id(paquete):
+    headers = paquete.get("headers", [])
+    
+    
+    msg_id = safe_get_header_value(headers, "msg_id")
+    if not msg_id:
+        msg_id = safe_get_header_value(headers, "id")  
+    
+    return msg_id
+
+def safe_get_path(paquete):
+    headers = paquete.get("headers", [])
+    
+    if isinstance(headers, dict):
+        return headers.get("path", [])
+    elif isinstance(headers, list):
+        return headers  
+    else:
+        return []
 
 
 class CommunicationMode(ABC):
@@ -36,6 +69,10 @@ class CommunicationMode(ABC):
     
     @abstractmethod
     def cleanup(self):
+        pass
+    
+    @abstractmethod
+    def set_protocol(self, protocol_name):
         pass
 
 class RoutingAlgorithm(ABC):
@@ -57,6 +94,10 @@ class RoutingAlgorithm(ABC):
     @abstractmethod
     def get_algorithm_name(self):
         pass
+    
+    @abstractmethod
+    def get_protocol_name(self):
+        pass
 
 
 
@@ -66,17 +107,25 @@ class LocalSocketMode(CommunicationMode):
         self.puerto = PUERTO_BASE_LOCAL + (ord(nodo_id.upper()) - ord('A'))
         self.servidor_socket = None
         self.activo = True
+        self.protocol_name = "generic"
+        
+    def set_protocol(self, protocol_name):
+        self.protocol_name = protocol_name
         
     def initialize(self):
         return True
     
     def send_message(self, destino, mensaje):
         try:
+            
+            mensaje_con_protocolo = mensaje.copy()
+            mensaje_con_protocolo["proto"] = self.protocol_name
+            
             puerto_destino = PUERTO_BASE_LOCAL + (ord(destino.upper()) - ord('A'))
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2)
                 s.connect(("localhost", puerto_destino))
-                s.sendall(json.dumps(mensaje).encode('utf-8'))
+                s.sendall(json.dumps(mensaje_con_protocolo).encode('utf-8'))
             return True
         except Exception as e:
             return False, str(e)
@@ -123,6 +172,7 @@ class RedisMode(CommunicationMode):
         self.redis_client = None
         self.pubsub = None
         self.activo = True
+        self.protocol_name = "generic"
         
         if channels_config:
             self.mis_canales = channels_config.get("subscribe", [f"sec20.topologia1.node{nodo_id.lower()}"])
@@ -130,6 +180,9 @@ class RedisMode(CommunicationMode):
         else:
             self.mis_canales = [f"sec20.topologia1.node{nodo_id.lower()}"]
             self.canales_vecinos = {}
+    
+    def set_protocol(self, protocol_name):
+        self.protocol_name = protocol_name
         
     def initialize(self):
         try:
@@ -163,16 +216,12 @@ class RedisMode(CommunicationMode):
                 canal_destino = f"sec20.topologia1.node{destino.lower()}"
             
             mensaje_redis = {
-                "proto": "gui_redis",
+                "proto": self.protocol_name,  
                 "type": mensaje.get("type", "message"),
                 "from": self.nodo_id,
                 "to": destino,
                 "ttl": mensaje.get("ttl", 5),
-                "headers": {
-                    "id": mensaje.get("headers", {}).get("id", str(uuid.uuid4())[:8]),
-                    "timestamp": datetime.now().isoformat(),
-                    "channel": canal_destino
-                },
+                "headers": mensaje.get("headers", {}),  
                 "payload": mensaje.get("payload", "")
             }
             
@@ -186,16 +235,12 @@ class RedisMode(CommunicationMode):
             enviados = 0
             for vecino, canal in self.canales_vecinos.items():
                 mensaje_redis = {
-                    "proto": "gui_redis",
+                    "proto": self.protocol_name,  
                     "type": mensaje.get("type", "message"),
                     "from": self.nodo_id,
                     "to": "broadcast",
                     "ttl": mensaje.get("ttl", 5),
-                    "headers": {
-                        "id": mensaje.get("headers", {}).get("id", str(uuid.uuid4())[:8]),
-                        "timestamp": datetime.now().isoformat(),
-                        "channel": canal
-                    },
+                    "headers": mensaje.get("headers", {}),  
                     "payload": mensaje.get("payload", "")
                 }
                 
@@ -235,6 +280,9 @@ class FloodingAlgorithm(RoutingAlgorithm):
     def get_algorithm_name(self):
         return "flooding"
     
+    def get_protocol_name(self):
+        return "flooding"
+    
     def process_message(self, paquete):
         tipo = paquete.get("type", "")
         origen = paquete.get("from", "")
@@ -246,12 +294,16 @@ class FloodingAlgorithm(RoutingAlgorithm):
             return f"MENSAJE RECIBIDO de {origen}: '{contenido}'"
         elif ttl > 1:
             paquete["ttl"] = ttl - 1
+            paquete["proto"] = self.get_protocol_name()  
             self.flood_message(paquete, origen)
             return f"Mensaje reenviado por flooding (TTL: {ttl-1})"
         else:
             return "TTL agotado, mensaje descartado"
     
     def flood_message(self, mensaje, origen=None):
+        
+        mensaje["proto"] = self.get_protocol_name()
+        
         if isinstance(self.communication_mode, RedisMode):
             self.communication_mode.broadcast_message(mensaje)
         else:
@@ -262,17 +314,15 @@ class FloodingAlgorithm(RoutingAlgorithm):
     def send_initial_messages(self):
         if self.nodo_id == "A":
             time.sleep(3)
+            
             mensaje = {
-                "proto": "flooding_gui",
+                "proto": self.get_protocol_name(),
                 "type": "message",
                 "from": self.nodo_id,
                 "to": "D",
                 "ttl": VALOR_TTL_INICIAL,
-                "headers": {
-                    "id": str(uuid.uuid4())[:8],
-                    "timestamp": datetime.now().isoformat()
-                },
-                "payload": f"Mensaje de prueba desde {self.nodo_id} usando Flooding!"
+                "headers": [self.nodo_id],  
+                "payload": f"Mensaje de prueba desde {self.nodo_id} usando {self.get_algorithm_name().upper()}!"
             }
             self.flood_message(mensaje)
 
@@ -289,6 +339,9 @@ class LinkStateAlgorithm(RoutingAlgorithm):
     
     def get_algorithm_name(self):
         return "link_state"
+    
+    def get_protocol_name(self):
+        return "lsr"
     
     def generar_lsp_propio(self):
         with self.lock:
@@ -342,6 +395,7 @@ class LinkStateAlgorithm(RoutingAlgorithm):
                 
                 if paquete.get("ttl", 0) > 1:
                     paquete["ttl"] = paquete["ttl"] - 1
+                    paquete["proto"] = self.get_protocol_name()  
                     if isinstance(self.communication_mode, RedisMode):
                         self.communication_mode.broadcast_message(paquete)
                     else:
@@ -405,6 +459,7 @@ class LinkStateAlgorithm(RoutingAlgorithm):
             info = self.tabla_enrutamiento[destino]
             siguiente_salto = info['next_hop']
             paquete["ttl"] = paquete["ttl"] - 1
+            paquete["proto"] = self.get_protocol_name()  
             
             self.communication_mode.send_message(siguiente_salto, paquete)
             return f"Mensaje reenviado a {destino} via {siguiente_salto}"
@@ -414,8 +469,9 @@ class LinkStateAlgorithm(RoutingAlgorithm):
     def enviar_lsp(self):
         lsp_info = self.lsdb.get(self.nodo_id)
         if lsp_info:
+            
             mensaje_lsp = {
-                "proto": "lsr_gui",
+                "proto": self.get_protocol_name(),
                 "type": "lsp",
                 "from": self.nodo_id,
                 "to": "broadcast",
@@ -453,8 +509,9 @@ class LinkStateAlgorithm(RoutingAlgorithm):
         
         if self.nodo_id == "A":
             time.sleep(10)
+            
             mensaje = {
-                "proto": "lsr_gui",
+                "proto": self.get_protocol_name(),
                 "type": "message",
                 "from": self.nodo_id,
                 "to": "D",
@@ -463,7 +520,7 @@ class LinkStateAlgorithm(RoutingAlgorithm):
                     "id": str(uuid.uuid4())[:8],
                     "timestamp": datetime.now().isoformat()
                 },
-                "payload": f"Mensaje de prueba desde {self.nodo_id} usando LSR!"
+                "payload": f"Mensaje de prueba desde {self.nodo_id} usando {self.get_algorithm_name().upper()}!"
             }
             
             if "D" in self.tabla_enrutamiento:
@@ -481,6 +538,9 @@ class DistanceVectorAlgorithm(RoutingAlgorithm):
     
     def get_algorithm_name(self):
         return "distance_vector"
+    
+    def get_protocol_name(self):
+        return "dvr"
     
     def inicializar_tabla(self):
         with self.lock:
@@ -546,6 +606,7 @@ class DistanceVectorAlgorithm(RoutingAlgorithm):
                 if info['distance'] < MAX_DISTANCIA:
                     siguiente_salto = info['next_hop']
                     paquete["ttl"] = paquete["ttl"] - 1
+                    paquete["proto"] = self.get_protocol_name()  
                     self.communication_mode.send_message(siguiente_salto, paquete)
                     return f"Mensaje reenviado a {destino} via {siguiente_salto}"
                 else:
@@ -560,8 +621,9 @@ class DistanceVectorAlgorithm(RoutingAlgorithm):
                 if info['distance'] < MAX_DISTANCIA:
                     vector_distancias[destino] = info['distance']
         
+        
         mensaje = {
-            "proto": "dvr_gui",
+            "proto": self.get_protocol_name(),
             "type": "distance_vector",
             "from": self.nodo_id,
             "to": "broadcast",
@@ -591,8 +653,9 @@ class DistanceVectorAlgorithm(RoutingAlgorithm):
         
         if self.nodo_id == "A":
             time.sleep(8)
+            
             mensaje = {
-                "proto": "dvr_gui",
+                "proto": self.get_protocol_name(),
                 "type": "message",
                 "from": self.nodo_id,
                 "to": "D",
@@ -601,7 +664,7 @@ class DistanceVectorAlgorithm(RoutingAlgorithm):
                     "id": str(uuid.uuid4())[:8],
                     "timestamp": datetime.now().isoformat()
                 },
-                "payload": f"Mensaje de prueba desde {self.nodo_id} usando DVR!"
+                "payload": f"Mensaje de prueba desde {self.nodo_id} usando {self.get_algorithm_name().upper()}!"
             }
             
             with self.lock:
@@ -638,6 +701,28 @@ class EnhancedNetworkGUI:
         self.topologia_completa = {}
         
         self.crear_interfaz()
+    
+    def crear_mensaje_compatible(self, tipo, destino, contenido, protocolo):
+        if protocolo == "flooding":
+            
+            headers = [self.nodo_id]
+        else:
+            
+            headers = {
+                "id": str(uuid.uuid4())[:8],
+                "timestamp": datetime.now().isoformat(),
+                "path": [self.nodo_id]
+            }
+        
+        return {
+            "proto": protocolo,
+            "type": tipo,
+            "from": self.nodo_id,
+            "to": destino,
+            "ttl": VALOR_TTL_INICIAL,
+            "headers": headers,
+            "payload": contenido
+        }
     
     def crear_interfaz(self):
         main_frame = ttk.Frame(self.ventana, padding=10)
@@ -835,6 +920,12 @@ class EnhancedNetworkGUI:
                 self.routing_algorithm = DistanceVectorAlgorithm(self.nodo_id, self.vecinos, self.communication_mode)
             
             
+            if hasattr(self.routing_algorithm, 'get_protocol_name'):
+                protocol_name = self.routing_algorithm.get_protocol_name()
+                self.communication_mode.set_protocol(protocol_name)
+                self.log_mensaje(f"[{self.nodo_id}] Protocolo configurado: {protocol_name}", "sistema")
+            
+            
             status_msg = self.communication_mode.start_listening(self.procesar_mensaje_recibido)
             
             
@@ -878,30 +969,25 @@ class EnhancedNetworkGUI:
             messagebox.showwarning("Advertencia", "Destino y mensaje requeridos")
             return
         
-        mensaje = {
-            "proto": "gui_manual",
-            "type": tipo,
-            "from": self.nodo_id,
-            "to": destino,
-            "ttl": VALOR_TTL_INICIAL,
-            "headers": {
-                "id": str(uuid.uuid4())[:8],
-                "timestamp": datetime.now().isoformat()
-            },
-            "payload": contenido
-        }
+        
+        protocol_name = "gui_manual"  
+        if hasattr(self.routing_algorithm, 'get_protocol_name'):
+            protocol_name = self.routing_algorithm.get_protocol_name()
+        
+        
+        mensaje = self.crear_mensaje_compatible(tipo, destino, contenido, protocol_name)
         
         result = self.communication_mode.send_message(destino, mensaje)
         
         if isinstance(result, tuple):
             success, error = result
             if success:
-                self.log_mensaje(f"→ Enviado a {destino} ({tipo}): {contenido}", "enviado")
+                self.log_mensaje(f"→ Enviado a {destino} ({protocol_name}/{tipo}): {contenido}", "enviado")
                 self.mensaje_entry.delete(0, tk.END)
             else:
                 self.log_mensaje(f"✗ Error enviando a {destino}: {error}", "error")
         elif result:
-            self.log_mensaje(f"→ Enviado a {destino} ({tipo}): {contenido}", "enviado")
+            self.log_mensaje(f"→ Enviado a {destino} ({protocol_name}/{tipo}): {contenido}", "enviado")
             self.mensaje_entry.delete(0, tk.END)
         else:
             self.log_mensaje(f"✗ Error enviando a {destino}", "error")
@@ -916,7 +1002,9 @@ class EnhancedNetworkGUI:
             tipo = paquete.get("type", "message")
             ttl = paquete.get("ttl", 0)
             proto = paquete.get("proto", "unknown")
-            msg_id = paquete.get("headers", {}).get("id")
+            
+            
+            msg_id = safe_get_msg_id(paquete)
             
             
             if msg_id and msg_id in self.mensajes_recibidos:
@@ -985,6 +1073,11 @@ class EnhancedNetworkGUI:
         estado = f"Estado del Nodo: {self.nodo_id}\n"
         estado += f"Modo: {modo.upper()}\n"
         estado += f"Algoritmo: {algoritmo.upper()}\n"
+        
+        
+        if self.routing_algorithm and hasattr(self.routing_algorithm, 'get_protocol_name'):
+            estado += f"Protocolo: {self.routing_algorithm.get_protocol_name()}\n"
+        
         estado += f"Vecinos: {', '.join(self.vecinos)}\n"
         estado += f"Mensajes recibidos: {len(self.mensajes_recibidos)}\n"
         
@@ -1067,7 +1160,7 @@ class EnhancedNetworkGUI:
                 
                 self.configuracion_redis.update(config.get('redis', {}))
                 
-                self.log_mensaje("✓ Configuración cargada exitosamente", "sistema")
+                self.log_mensaje("Configuración cargada exitosamente", "sistema")
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Error cargando configuración: {e}")
@@ -1085,11 +1178,11 @@ class EnhancedNetworkGUI:
             test_client.ping()
             test_client.close()
             
-            self.log_mensaje("✓ Conectividad Redis OK", "sistema")
+            self.log_mensaje("Conectividad Redis OK", "sistema")
             messagebox.showinfo("Conectividad", "Conexión a Redis exitosa")
             
         except Exception as e:
-            self.log_mensaje(f"✗ Error conectividad Redis: {e}", "error")
+            self.log_mensaje(f"Error conectividad Redis: {e}", "error")
             messagebox.showerror("Error", f"No se pudo conectar a Redis: {e}")
     
     def limpiar_log(self):

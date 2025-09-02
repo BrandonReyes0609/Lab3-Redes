@@ -6,9 +6,9 @@
     "password": "UVGRedis2025"
   },
   "channels": {
-    "subscribe": ["sec20.topologia1.node5.test1"],
+    "subscribe": ["sec20.topologia1.node5"],
     "neighbors": {
-      "B": "sec20.topologia1.node5.test2",
+      "B": "sec20.topologia1.node2",
       "C": "sec20.topologia1.node5.test3"
     }
   },
